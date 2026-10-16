@@ -76,21 +76,6 @@ def test_disabled_sync_dispatch_does_not_create_a_task():
     create.assert_not_called()
 
 
-def test_disabled_sync_does_not_register_recording_trigger(monkeypatch):
-    client = TuyaRecordingsClient(
-        {"thumbnail_sync_enabled": False, "media_sync_enabled": False},
-        recordings_backend=FakeAvailableBackend(),
-    )
-    hass = SimpleNamespace(
-        data={integration.DOMAIN: {"entry": {"client": client}}},
-    )
-    entry = SimpleNamespace(entry_id="entry")
-
-    integration._async_setup_recording_triggers(hass, entry)
-
-    assert integration.DATA_RECORDING_TRIGGER_UNSUB not in hass.data[integration.DOMAIN]["entry"]
-
-
 def test_unconfigured_native_backend_does_not_schedule_startup_work(monkeypatch):
     client = TuyaRecordingsClient({
         "thumbnail_sync_enabled": True,

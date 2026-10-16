@@ -1,4 +1,4 @@
-"""Exercise the real browser player with a local TRS2 stream, never a camera."""
+"""Exercise the real browser player with local TRS3 streams, never a camera."""
 
 from __future__ import annotations
 
@@ -14,13 +14,26 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+from custom_components.tuya_recordings.lib.native_frames import (
+    NATIVE_PLAYBACK_EVENT_VERSION,
+    NativePlaybackFrame,
+    NativePlaybackFrameType,
+    playback_frame_event,
+)
+from custom_components.tuya_recordings.lib.native_mux import (
+    BROWSER_STREAM_END,
+    NativePlaybackBrowserStreamMuxer,
+    browser_stream_header,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "custom_components" / "tuya_recordings" / "frontend"
 HEADER = struct.Struct(">BQI")
 
 
-def fragmented_h264(path: Path) -> bytes:
+def native_browser_stream(path: Path) -> bytes:
+    """Build the same fMP4 record stream the native camera path emits."""
     subprocess.run(
         [
             "ffmpeg",
@@ -38,18 +51,58 @@ def fragmented_h264(path: Path) -> bytes:
             "baseline",
             "-pix_fmt",
             "yuv420p",
-            "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
+            "-g",
+            "15",
             "-f",
-            "mp4",
+            "h264",
             "-y",
             str(path),
         ],
         check=True,
         timeout=30,
     )
-    return path.read_bytes()
+    def event(frame_type, payload=b"", info=None):
+        return playback_frame_event(
+            NativePlaybackFrame(frame_type, payload, info or {}),
+            protocol=NATIVE_PLAYBACK_EVENT_VERSION,
+        )
 
+    chunks: list[bytes] = []
+    # Keep native audio alive beyond the deliberate browser-stall regression
+    # below. A short fixture can end naturally before the 1.5-second stall
+    # detector runs, which would hide a broken audio-stop path.
+    pcm_s16le = struct.pack("<hhhh", 0, 8192, -8192, 16384) * 16_000
+    with NativePlaybackBrowserStreamMuxer(chunks.append) as muxer:
+        muxer.handle_event(event(NativePlaybackFrameType.STARTED))
+        muxer.handle_event(event(
+            NativePlaybackFrameType.MEDIA_CODEC,
+            path.read_bytes(),
+            {
+                "avChannel": 0,
+                "frameNo": 1,
+                "codecId": 27,
+                "codecName": "h264",
+                "isKeyFrame": True,
+                "timestamp": 90000,
+                "frameInfoBase64": "",
+            },
+        ))
+        muxer.handle_event(event(
+            NativePlaybackFrameType.MEDIA_CODEC,
+            pcm_s16le,
+            {
+                "avChannel": 1,
+                "frameNo": 2,
+                "codecId": 0xFFFE,
+                "codecName": "pcm_s16le",
+                "isKeyFrame": False,
+                "timestamp": 90000,
+                "sampleRate": 16000,
+                "channels": 1,
+                "frameInfoBase64": "",
+            },
+        ))
+    return b"".join(chunks)
 
 def record(kind: int, timestamp: int, payload: bytes = b"") -> bytes:
     return HEADER.pack(kind, timestamp, len(payload)) + payload
@@ -57,18 +110,24 @@ def record(kind: int, timestamp: int, payload: bytes = b"") -> bytes:
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as temporary:
-        media = fragmented_h264(Path(temporary) / "fixture.mp4")
-        pcm_s16le = struct.pack("<hhhh", 0, 8192, -8192, 16384) * 3_000
-        audio_format = struct.pack(">IB", 16000, 1)
-        stream = (
-            b"TRS2"
-            + record(5, 0, audio_format)
-            + record(2, 89000, pcm_s16le[:8000])
-            + record(1, 90000, media)
-            + record(2, 90000, pcm_s16le)
-            + record(3, 0)
-        )
-        timeline_stream = stream[: -len(record(3, 0))]
+        stream = native_browser_stream(Path(temporary) / "fixture.h264")
+        record_bytes = stream[len(browser_stream_header()) : -len(record(BROWSER_STREAM_END, 0))]
+        timeline_streams = {
+            "initial": browser_stream_header(1, 400) + record_bytes,
+            # This arrives after the final seek was accepted. It must be
+            # ignored wholesale, including its audio records.
+            "stale": (
+                browser_stream_header(1, 501)
+                # If stale records reach the parser, this would fail the test.
+                + record(5, 0, b"\\0")
+                + record_bytes
+            ),
+            "fresh": browser_stream_header(2, 502) + record_bytes,
+            "later": browser_stream_header(3, 501) + record_bytes,
+            "rapid_old": browser_stream_header(4, 500) + record_bytes,
+            "rapid_final": browser_stream_header(5, 502) + record_bytes,
+            "paused_seek": browser_stream_header(6, 501) + record_bytes,
+        }
         requests: list[str] = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -125,6 +184,9 @@ def main() -> None:
                 result = page.evaluate(
                     """async () => {
                       window.audioStarts = 0;
+                      window.audioStops = 0;
+                      window.audioSuspends = 0;
+                      window.audioResumes = 0;
                       window.firstAudioSamples = null;
                       window.audioSampleRates = [];
                       window.audioChannelCounts = [];
@@ -138,8 +200,31 @@ def main() -> None:
                         }
                         return originalStart.apply(this, args);
                       };
+                      const originalStop = AudioBufferSourceNode.prototype.stop;
+                      AudioBufferSourceNode.prototype.stop = function(...args) {
+                        window.audioStops += 1;
+                        return originalStop.apply(this, args);
+                      };
+                      const originalSuspend = AudioContext.prototype.suspend;
+                      AudioContext.prototype.suspend = function(...args) {
+                        window.audioSuspends += 1;
+                        return originalSuspend.apply(this, args);
+                      };
+                      const originalResume = AudioContext.prototype.resume;
+                      AudioContext.prototype.resume = function(...args) {
+                        window.audioResumes += 1;
+                        return originalResume.apply(this, args);
+                      };
                       const { attachCameraPlayer } = await import('/frontend/camera-player.js');
                       const video = document.querySelector('video');
+                      window.videoFrameCallbacks = 0;
+                      if (typeof video.requestVideoFrameCallback === 'function') {
+                        const nativeRequestVideoFrameCallback = video.requestVideoFrameCallback.bind(video);
+                        video.requestVideoFrameCallback = callback => {
+                          window.videoFrameCallbacks += 1;
+                          return nativeRequestVideoFrameCallback(callback);
+                        };
+                      }
                       window.playerDebug = [];
                       window.disposePlayer = attachCameraPlayer(video, {
                         cached: false,
@@ -204,6 +289,7 @@ def main() -> None:
                         firstAudioSamples: window.firstAudioSamples,
                         audioSampleRates: window.audioSampleRates,
                         audioChannelCounts: window.audioChannelCounts,
+                        videoFrameCallbacks: window.videoFrameCallbacks,
                         status: document.querySelector('[role=status]').textContent,
                         plyr: Boolean(video.plyr),
                         samePlayer: video.plyr === window.initialPlayer,
@@ -240,10 +326,27 @@ def main() -> None:
                     })"""
                 )
                 page.evaluate(
-                    """async encodedStream => {
-                      const bytes = Uint8Array.from(atob(encodedStream), value => value.charCodeAt(0));
+                    """async encodedStreams => {
+                      const decode = encoded => Uint8Array.from(atob(encoded), value => value.charCodeAt(0));
+                      const initial = decode(encodedStreams.initial);
+                      const stale = decode(encodedStreams.stale);
+                      const fresh = decode(encodedStreams.fresh);
+                      const later = decode(encodedStreams.later);
+                      const rapidOld = decode(encodedStreams.rapid_old);
+                      const rapidFinal = decode(encodedStreams.rapid_final);
+                      const pausedSeek = decode(encodedStreams.paused_seek);
+                      window.timelineResponses = [
+                        {data: fresh, delay: 20},
+                        {data: later, delay: 20},
+                        // The camera can finish the first seek after a newer
+                        // scrub position was already requested.
+                        {data: rapidOld, delay: 200},
+                        {data: rapidFinal, delay: 20},
+                        {data: pausedSeek, delay: 20},
+                      ];
                       window.timelineSockets = [];
                       window.timelineActions = [];
+                      window.timelineDebug = [];
                       window.WebSocket = class FakeTimelineSocket extends EventTarget {
                         static OPEN = 1;
                         constructor(url) {
@@ -254,14 +357,34 @@ def main() -> None:
                           queueMicrotask(() => {
                             this.readyState = FakeTimelineSocket.OPEN;
                             this.dispatchEvent(new Event('open'));
-                            this.dispatchEvent(new MessageEvent('message', { data: bytes.buffer.slice(0) }));
+                            // WebSocket framing is arbitrary: prove the
+                            // browser preserves a split segment header.
+                            this.dispatchEvent(new MessageEvent('message', { data: initial.buffer.slice(0, 7) }));
+                            setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+                              data: initial.buffer.slice(7),
+                            })), 1);
                           });
                         }
                         send(payload) {
                           const command = JSON.parse(payload);
                           window.timelineActions.push(command);
                           if (command.action === 'seek') {
-                            queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: bytes.buffer.slice(0) })));
+                            queueMicrotask(() => {
+                              this.dispatchEvent(new MessageEvent('message', {
+                                data: JSON.stringify({ type: 'seeking', position: command.position }),
+                              }));
+                              // A seek can have one old native segment queued.
+                              // It must not touch the fresh media pipeline.
+                              setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+                                data: stale.buffer.slice(0),
+                              })), 5);
+                              const response = window.timelineResponses.shift();
+                              if (response) {
+                                setTimeout(() => this.dispatchEvent(new MessageEvent('message', {
+                                  data: response.data.buffer.slice(0),
+                                })), response.delay);
+                              }
+                            });
                           }
                         }
                         close() {
@@ -287,10 +410,11 @@ def main() -> None:
                         autoplay: true,
                         mode: 'timeline',
                         onPosition: position => { window.timelinePosition = position; },
+                        debug: event => window.timelineDebug.push(event),
                       });
                       window.timelinePlayer = video.plyr;
                     }""",
-                    base64.b64encode(timeline_stream).decode(),
+                    {name: base64.b64encode(value).decode() for name, value in timeline_streams.items()},
                 )
                 try:
                     page.wait_for_function(
@@ -330,23 +454,145 @@ def main() -> None:
                       window.disposePlayer.playClip(clip, 0);
                       window.disposePlayer.playClip(clip, 1);
                       window.disposePlayer.playClip(clip, 2);
+                      // A detached MediaSource can deliver a late ended event
+                      // after the seek has begun. It must not pause the fresh
+                      // pipeline before its first video frame.
+                      const seekVideo = document.querySelector('video');
+                      Object.defineProperty(seekVideo, 'ended', { value: true, configurable: true });
+                      seekVideo.dispatchEvent(new Event('ended'));
+                      delete seekVideo.ended;
                     }"""
                 )
                 page.wait_for_function(
                     "window.timelineActions.some(item => item.action === 'seek' && item.position === 502) && window.audioStarts > 3",
                     timeout=15_000,
                 )
+                # A seek is not successful merely because the camera accepted
+                # it: the rebuilt MediaSource must advance at the new epoch.
+                page.wait_for_function(
+                    "window.timelinePosition > 502.2 && document.querySelector('video').currentTime > 0.2",
+                    timeout=15_000,
+                )
                 page.wait_for_function(
                     "document.querySelector('video').buffered.length && document.querySelector('video').buffered.start(0) < 0.1",
                     timeout=5_000,
+                )
+                page.evaluate(
+                    """() => {
+                      window.disposePlayer.playClip({
+                        cached: false,
+                        duration: 3,
+                        start: 500,
+                        end: 503,
+                        playback_url: '/timeline',
+                        stream_transport: 'native',
+                      }, 1);
+                    }"""
+                )
+                page.wait_for_function(
+                    """() => window.timelineActions.at(-1)?.position === 501
+                      && window.timelineDebug.some(event => event.phase === 'stream-header'
+                        && event.generation === 3 && event.position === 501)
+                      && document.querySelector('video').currentTime > 0.2""",
+                    timeout=15_000,
+                )
+                page.evaluate(
+                    """() => {
+                      const clip = {
+                        cached: false,
+                        duration: 3,
+                        start: 500,
+                        end: 503,
+                        playback_url: '/timeline',
+                        stream_transport: 'native',
+                      };
+                      // Let the first delayed request leave the debounce queue,
+                      // then scrub again before its native segment arrives.
+                      window.disposePlayer.playClip(clip, 0);
+                      setTimeout(() => window.disposePlayer.playClip(clip, 2), 80);
+                    }"""
+                )
+                page.wait_for_function(
+                    """() => window.timelineActions.at(-1)?.position === 502
+                      && window.timelineDebug.some(event => event.phase === 'segment-discarded'
+                        && event.generation === 4 && event.position === 500)
+                      && window.timelineDebug.some(event => event.phase === 'stream-header'
+                        && event.generation === 5 && event.position === 502)
+                      && document.querySelector('video').currentTime > 0.2""",
+                    timeout=15_000,
                 )
                 timeline.update(page.evaluate(
                     """() => ({
                       socketCount: window.timelineSockets.length,
                       actions: window.timelineActions,
                       samePlayerAfterSeek: document.querySelector('video').plyr === window.timelinePlayer,
+                      debug: window.timelineDebug,
                     })"""
                 ))
+                post_seek_error = page.evaluate(
+                    """async () => {
+                      const video = document.querySelector('video');
+                      video.dispatchEvent(new Event('error'));
+                      await new Promise(resolve => setTimeout(resolve, 50));
+                      return {
+                        source: Boolean(video.getAttribute('src')),
+                        paused: video.paused,
+                        status: document.querySelector('[role=status]').textContent,
+                        ignored: window.timelineDebug.some(event => event.phase === 'stale-media-error-ignored'),
+                      };
+                    }"""
+                )
+                stalled_audio = page.evaluate(
+                    """async () => {
+                      const video = document.querySelector('video');
+                      // Capture-phase suppression freezes the player's
+                      // observed video clock without pausing the element.
+                      // That models a decoder stall while a separately
+                      // scheduled audio buffer still has data to play.
+                      window.addEventListener('timeupdate', event => event.stopImmediatePropagation(), true);
+                      Object.defineProperty(video, 'readyState', { value: 1, configurable: true });
+                      const stopsBefore = window.audioStops;
+                      const suspendsBefore = window.audioSuspends;
+                      const resumesBefore = window.audioResumes;
+                      video.dispatchEvent(new Event('waiting'));
+                      await new Promise(resolve => setTimeout(resolve, 1700));
+                      const stalledStatus = document.querySelector('[role=status]').textContent;
+                      const stalledLoading = document.querySelector('.plyr').classList.contains('plyr--loading');
+                      video.dispatchEvent(new Event('playing'));
+                      await new Promise(resolve => setTimeout(resolve, 20));
+                      return {
+                        stalledStatus,
+                        stalledLoading,
+                        stops: window.audioStops - stopsBefore,
+                        suspends: window.audioSuspends - suspendsBefore,
+                        resumes: window.audioResumes - resumesBefore,
+                        recoveredStatus: document.querySelector('[role=status]').textContent,
+                        stalled: window.timelineDebug.some(event => event.phase === 'audio-stalled'),
+                      };
+                    }"""
+                )
+                page.evaluate(
+                    """() => {
+                      window.disposePlayer.pause();
+                      window.disposePlayer.playClip({
+                        cached: false,
+                        duration: 3,
+                        start: 500,
+                        end: 503,
+                        playback_url: '/timeline',
+                        stream_transport: 'native',
+                      }, 1);
+                    }"""
+                )
+                page.wait_for_function(
+                    """() => {
+                      const actions = window.timelineActions;
+                      const seek = actions.findLastIndex(item => item.action === 'seek' && item.position === 501);
+                      return seek >= 0 && actions[seek + 1]?.action === 'resume';
+                    }""",
+                    timeout=15_000,
+                )
+                paused_seek_actions = page.evaluate("window.timelineActions.slice(-3)")
                 stale_restart = page.evaluate(
                     """async () => {
                       const video = document.querySelector('video');
@@ -358,9 +604,14 @@ def main() -> None:
                         originalDestroy();
                       };
                       const before = window.finalSignCalls;
+                      const audioStopsBefore = window.audioStops;
                       window.disposePlayer();
                       await new Promise(resolve => setTimeout(resolve, 100));
-                      return window.finalSignCalls - before;
+                      return {
+                        unexpectedSignCalls: window.finalSignCalls - before,
+                        audioStops: window.audioStops - audioStopsBefore,
+                        socketClosed: window.timelineSockets.at(-1)?.readyState === 3,
+                      };
                     }"""
                 )
                 page.screenshot(path=str(Path(temporary) / "native-player.png"))
@@ -387,6 +638,7 @@ def main() -> None:
     assert report["firstAudioSamples"] == [0, 0.25, -0.25, 0.5]
     assert report["audioSampleRates"] == [16000, 16000]
     assert report["audioChannelCounts"] == [1, 1]
+    assert report["videoFrameCallbacks"] >= 2
     assert report["time"] > 0.2
     assert not report["paused"]
     assert report["status"] == ""
@@ -398,9 +650,34 @@ def main() -> None:
     assert timeline["socketCount"] == 1
     assert timeline["samePlayerAfterSeek"] is True
     assert [item for item in timeline["actions"] if item["action"] == "seek"] == [
-        {"action": "seek", "position": 502}
+        {"action": "seek", "position": 502},
+        {"action": "seek", "position": 501},
+        {"action": "seek", "position": 500},
+        {"action": "seek", "position": 502},
     ]
-    assert stale_restart == 0
+    assert paused_seek_actions[-2:] == [
+        {"action": "seek", "position": 501},
+        {"action": "resume"},
+    ]
+    assert any(event["phase"] == "seek-requested" and event["position"] == 502 for event in timeline["debug"])
+    assert any(event["phase"] == "segment-discarded" and event["position"] == 501 for event in timeline["debug"])
+    assert any(event["phase"] == "stream-header" and event["generation"] == 2 and event["position"] == 502 for event in timeline["debug"])
+    assert any(event["phase"] == "stream-header" and event["generation"] == 3 and event["position"] == 501 for event in timeline["debug"])
+    assert any(event["phase"] == "segment-discarded" and event["generation"] == 4 and event["position"] == 500 for event in timeline["debug"])
+    assert any(event["phase"] == "stream-header" and event["generation"] == 5 and event["position"] == 502 for event in timeline["debug"])
+    assert post_seek_error == {"source": True, "paused": False, "status": "", "ignored": True}
+    assert stalled_audio["stalledStatus"] == "Waiting for video"
+    assert stalled_audio["stalledLoading"] is True
+    assert stalled_audio["stops"] > 0
+    assert stalled_audio["suspends"] == 1
+    assert stalled_audio["resumes"] == 1
+    assert stalled_audio["recoveredStatus"] == ""
+    assert stalled_audio["stalled"] is True
+    assert stale_restart == {
+        "unexpectedSignCalls": 0,
+        "audioStops": 0,
+        "socketClosed": True,
+    }, stale_restart
     print(json.dumps({"requests": requests, **report}, sort_keys=True))
 
 

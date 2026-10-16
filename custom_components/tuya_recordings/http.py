@@ -4,7 +4,7 @@ import asyncio
 import logging
 import queue
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -12,11 +12,14 @@ from urllib.parse import quote
 from aiohttp import WSCloseCode, web
 
 from homeassistant.components import http
+from homeassistant.components.recorder import history
+from homeassistant.const import STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .client import TuyaRecordingsAuthError, TuyaRecordingsClient
 from .lib.commands import CameraWorkBusy, CameraWorkCancelled
+from .lib.recordings import as_epoch_seconds
 from .const import (
     DATA_INTERACTIVE_PLAYBACK_ACTIVE,
     DOMAIN,
@@ -163,6 +166,38 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
         "stats": stats,
         "cameras": cameras,
     }
+
+
+def _person_detection_timestamps(
+    hass: HomeAssistant, entity_id: str, start: datetime, end: datetime
+) -> list[int]:
+    """Read person detections at the time reported by the camera."""
+    states = history.state_changes_during_period(
+        hass,
+        start,
+        end,
+        entity_id=entity_id,
+        no_attributes=False,
+        include_start_time_state=False,
+    ).get(entity_id, [])
+    day_start = int(start.timestamp())
+    day_end = int(end.timestamp())
+    timestamps: list[int] = []
+    for state in states:
+        if state.state != STATE_ON:
+            continue
+        event_attributes = state.attributes.get("last_event_attributes")
+        attributes = event_attributes if isinstance(event_attributes, dict) else state.attributes
+        # These are ordered by how closely they describe when the camera saw
+        # the event. HA's state time is only the receipt-time fallback.
+        timestamp = 0
+        for key in ("time", "timestamp", "dp_timestamp"):
+            candidate = as_epoch_seconds(attributes.get(key))
+            if day_start <= candidate < day_end:
+                timestamp = candidate
+                break
+        timestamps.append(timestamp or int(state.last_changed.timestamp()))
+    return timestamps
 
 
 def _empty_stats(client: TuyaRecordingsClient) -> dict[str, Any]:
@@ -331,6 +366,20 @@ def _timeline_socket_url(dev_id: str) -> str:
     return f"/api/{DOMAIN}/timeline/{quote(dev_id)}"
 
 
+def _claim_playback_handoff(
+    domain_data: dict[str, Any],
+) -> tuple[int, threading.Event]:
+    """Give the newest browser request ownership before it waits for the lock."""
+    generation = int(domain_data.get(_DATA_PLAYBACK_GENERATION, 0)) + 1
+    domain_data[_DATA_PLAYBACK_GENERATION] = generation
+    stop_event = threading.Event()
+    active_stop = domain_data.get(_DATA_PLAYBACK_STOP)
+    domain_data[_DATA_PLAYBACK_STOP] = stop_event
+    if isinstance(active_stop, threading.Event):
+        active_stop.set()
+    return generation, stop_event
+
+
 def _timeline_range_for_time(index: dict[str, Any], dev_id: str, position: int) -> tuple[int, int] | None:
     """Resolve a wall-clock position to a real catalog range for one camera."""
     ranges: list[tuple[int, int]] = []
@@ -431,7 +480,50 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
             data["catalog_refresh_pending"] = refresh_pending
         else:
             data = await self.hass.async_add_executor_job(self._build_data, client)
+        selected_date = data.get("selected_date") or request.query.get("date")
+        if selected_date:
+            await self._add_person_detection_markers(data, selected_date)
         return web.json_response(data)
+
+    async def _add_person_detection_markers(
+        self, data: dict[str, Any], selected_date: str
+    ) -> None:
+        """Attach local person-detection history for the selected timeline day."""
+        try:
+            selected_day = date.fromisoformat(selected_date)
+        except ValueError:
+            return
+        camera_ids = {
+            str(camera.get("dev_id") or "") for camera in data.get("cameras", [])
+        }
+        sources: dict[str, str] = {}
+        for state in self.hass.states.async_all("binary_sensor"):
+            attributes = state.attributes
+            source = str(attributes.get("source_tuya_device_id") or "")
+            codes = set(attributes.get("alert_codes") or ())
+            if source in camera_ids and codes == {"ipc_human", "ipc_linger", "ipc_passby"}:
+                sources[source] = state.entity_id
+        if not sources:
+            return
+        start = dt_util.start_of_local_day(selected_day)
+        end = start + timedelta(days=1)
+        try:
+            results = await asyncio.gather(
+                *(
+                    self.hass.async_add_executor_job(
+                        _person_detection_timestamps, self.hass, entity_id, start, end
+                    )
+                    for entity_id in sources.values()
+                )
+            )
+        except Exception as err:  # Recorder must never block SD-card playback.
+            _LOGGER.debug("Unable to load person-detection history: %s", err)
+            return
+        detections = dict(zip(sources, results, strict=True))
+        for camera in data.get("cameras", []):
+            camera["person_detections"] = detections.get(
+                str(camera.get("dev_id") or ""), []
+            )
 
     def _schedule_catalog_refresh(
         self,
@@ -589,18 +681,11 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
         _raise_native_playback_unavailable(client)
         domain_data = self.hass.data.setdefault(DOMAIN, {})
         lock = domain_data.setdefault(_DATA_PLAYBACK_LOCK, asyncio.Lock())
-        generation = int(domain_data.get(_DATA_PLAYBACK_GENERATION, 0)) + 1
-        domain_data[_DATA_PLAYBACK_GENERATION] = generation
+        # Claim ownership before waiting. This is the same handoff discipline as
+        # the timeline websocket: a newer request cancels an older producer and
+        # a superseded waiter can never start a stale camera transaction.
+        generation, stop_event = _claim_playback_handoff(domain_data)
         _pause_background_camera_work(self.hass, client, generation)
-        active_stop = domain_data.get(_DATA_PLAYBACK_STOP)
-        if isinstance(active_stop, threading.Event):
-            active_stop.set()
-            _LOGGER.debug(
-                "Tuya Recordings handing active playback to dev=%s start=%s end=%s",
-                dev_id,
-                start_int,
-                end_int,
-            )
         try:
             await asyncio.wait_for(lock.acquire(), timeout=_PLAYBACK_HANDOFF_TIMEOUT)
         except TimeoutError as err:
@@ -608,11 +693,10 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
             raise web.HTTPServiceUnavailable(
                 reason="Previous Tuya recording playback did not close cleanly"
             ) from err
-        if generation != domain_data.get(_DATA_PLAYBACK_GENERATION):
+        if stop_event.is_set():
             lock.release()
+            _resume_background_camera_work(self.hass, client, generation)
             raise web.HTTPConflict(reason="Playback request was replaced by a newer clip")
-        stop_event = threading.Event()
-        domain_data[_DATA_PLAYBACK_STOP] = stop_event
         try:
             return await self._stream_native_clip(
                 request,
@@ -784,12 +868,8 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
         await ws.prepare(request)
         domain_data = self.hass.data.setdefault(DOMAIN, {})
         lock = domain_data.setdefault(_DATA_PLAYBACK_LOCK, asyncio.Lock())
-        generation = int(domain_data.get(_DATA_PLAYBACK_GENERATION, 0)) + 1
-        domain_data[_DATA_PLAYBACK_GENERATION] = generation
+        generation, stop_event = _claim_playback_handoff(domain_data)
         _pause_background_camera_work(self.hass, client, generation)
-        active_stop = domain_data.get(_DATA_PLAYBACK_STOP)
-        if isinstance(active_stop, threading.Event):
-            active_stop.set()
         active_ws = domain_data.get(_DATA_PLAYBACK_WS)
         if isinstance(active_ws, web.WebSocketResponse) and not active_ws.closed:
             # Waking only the camera producer is insufficient: the superseded
@@ -808,7 +888,15 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
             await ws.close()
             return ws
 
-        stop_event = threading.Event()
+        # A newer browser request may have superseded this one while it was
+        # waiting for the older session to release the serialized camera.
+        # Do not start an already-obsolete camera transaction.
+        if stop_event.is_set():
+            lock.release()
+            _resume_background_camera_work(self.hass, client, generation)
+            await ws.close()
+            return ws
+
         commands: queue.Queue[tuple[str, Any]] = queue.Queue()
         chunks: queue.Queue[bytes | Exception | object] = queue.Queue(maxsize=8)
         sentinel = object()

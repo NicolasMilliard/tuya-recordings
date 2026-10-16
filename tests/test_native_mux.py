@@ -9,6 +9,8 @@ from custom_components.tuya_recordings.lib.native_frames import (
     playback_frame_event,
 )
 from custom_components.tuya_recordings.lib.native_mux import (
+    BROWSER_STREAM_MAGIC,
+    browser_stream_header,
     BROWSER_STREAM_VIDEO,
     NativeMuxError,
     NativePlaybackBrowserStreamMuxer,
@@ -182,7 +184,7 @@ def test_interactive_browser_muxer_replaces_only_media_segment_on_seek():
         lambda chunk: None,
         muxer_factory=SegmentMuxer,
     )
-    muxer.handle_event(event(NativePlaybackFrameType.STARTED, info={"generation": 1}))
+    muxer.handle_event(event(NativePlaybackFrameType.STARTED, info={"generation": 1, "position": 100}))
     muxer.handle_event(
         event(
             NativePlaybackFrameType.MEDIA_CODEC,
@@ -190,7 +192,7 @@ def test_interactive_browser_muxer_replaces_only_media_segment_on_seek():
             media_info("h264", 27, key_frame=True),
         )
     )
-    muxer.handle_event(event(NativePlaybackFrameType.STARTED, info={"generation": 2}))
+    muxer.handle_event(event(NativePlaybackFrameType.STARTED, info={"generation": 2, "position": 200}))
     muxer.finish()
 
     assert len(instances) == 2
@@ -198,6 +200,75 @@ def test_interactive_browser_muxer_replaces_only_media_segment_on_seek():
     assert len(instances[0].events) == 2
     assert instances[0].events[0]["payload"]["type"] == "started"
     assert instances[1].opened and instances[1].finished
+
+
+def test_browser_stream_header_carries_generation_and_camera_position():
+    header = browser_stream_header(42, 1_728_000_123)
+
+    assert header[:4] == BROWSER_STREAM_MAGIC
+    assert int.from_bytes(header[4:8], "big") == 42
+    assert int.from_bytes(header[8:16], "big") == 1_728_000_123
+
+
+def test_interactive_muxer_applies_native_seek_identity_to_browser_segment():
+    instances = []
+
+    class HeaderMuxer(NativePlaybackBrowserStreamMuxer):
+        def __init__(self, callback):
+            super().__init__(callback)
+            self.opened = False
+            self.cleaned = False
+            self.finished = False
+            self.events = []
+            instances.append(self)
+
+        def open(self):
+            self.opened = True
+
+        def handle_event(self, item):
+            self.events.append(item)
+
+        def cleanup(self):
+            self.cleaned = True
+
+        def finish(self):
+            self.finished = True
+
+    muxer = NativePlaybackInteractiveBrowserMuxer(
+        lambda chunk: None,
+        muxer_factory=HeaderMuxer,
+    )
+    muxer.handle_event(
+        event(NativePlaybackFrameType.STARTED, info={"generation": 7, "position": 1_728_000_123})
+    )
+    muxer.finish()
+
+    assert len(instances) == 1
+    assert instances[0].stream_header == browser_stream_header(7, 1_728_000_123)
+    assert instances[0].opened and instances[0].finished
+
+
+def test_browser_stream_waits_for_decoder_config_and_idr_before_writing():
+    written = []
+
+    class RecordingMuxer(NativePlaybackBrowserStreamMuxer):
+        def _write_video(self, data):
+            written.append(data)
+
+    muxer = RecordingMuxer(lambda chunk: None)
+    sps = b"\x00\x00\x00\x01\x67sps"
+    pps = b"\x00\x00\x00\x01\x68pps"
+    inter = b"\x00\x00\x00\x01\x41inter"
+    idr = b"\x00\x00\x00\x01\x65idr"
+
+    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, sps, media_info("h264", 27)))
+    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, pps, media_info("h264", 27)))
+    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, inter, media_info("h264", 27)))
+    assert written == []
+
+    muxer.handle_event(event(NativePlaybackFrameType.MEDIA_CODEC, idr, media_info("h264", 27)))
+
+    assert written == [sps + pps + idr]
 
 
 def test_browser_stream_skips_video_until_first_sps():

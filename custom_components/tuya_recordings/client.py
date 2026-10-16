@@ -647,13 +647,12 @@ class TuyaRecordingsClient:
     ) -> dict[str, Any]:
         """Render thumbnails from already cached clips without touching cameras."""
         limit = max(1, int(limit or 1))
-        with camera_work_scope(cancellation) as active:
-            if active.is_set():
-                raise CameraWorkCancelled("Thumbnail sync cancelled before local thumbnail work")
-            return self.populate_thumbnails(
-                limit,
-                ignore_catalog_backoff=True,
-            )
+        if cancellation.is_set():
+            raise CameraWorkCancelled("Thumbnail sync cancelled before local thumbnail work")
+        return self.populate_thumbnails(
+            limit,
+            ignore_catalog_backoff=True,
+        )
 
     def reset_camera_work_backoff(self) -> None:
         """Allow one explicit resume attempt without stale failure delays."""
@@ -1303,16 +1302,16 @@ class TuyaRecordingsClient:
         autofill: bool = False,
         ignore_catalog_backoff: bool = False,
     ) -> dict[str, Any]:
-        with camera_work_scope(self.background_work_cancellation(
+        cancellation = self.background_work_cancellation(
             self._thumbnail_cancel_event if self.thumbnail_sync_enabled else None
-        )) as cancellation:
-            return self._populate_thumbnail_candidates_inner(
-                candidates,
-                limit,
-                autofill,
-                cancellation,
-                ignore_catalog_backoff,
-            )
+        )
+        return self._populate_thumbnail_candidates_inner(
+            candidates,
+            limit,
+            autofill,
+            cancellation,
+            ignore_catalog_backoff,
+        )
 
     def _populate_thumbnail_candidates_inner(
         self,

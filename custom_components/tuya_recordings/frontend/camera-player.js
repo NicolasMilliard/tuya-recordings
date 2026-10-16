@@ -26,9 +26,15 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   let firstVideoTimestamp = null;
   let videoAudioStartTime = 0;
   const audioSources = new Set();
+  let audioStalled = false;
+  let activeSegmentGeneration = -1;
+  let expectedTimelinePosition = null;
+  let discardSegment = false;
   let clipEndTimer = null;
   let waitingTimer = null;
+  let lastPlaybackProgress = 0;
   let playingReportedRevision = -1;
+  let progressReportedRevision = -1;
   let player = null;
   let clip = initialClip;
   // A config-entry reload does not replace already imported Python modules.
@@ -60,6 +66,16 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   const position = () => continuous
     ? offset + (Number(video.currentTime) || 0)
     : Math.min(clip.duration, offset + (Number(video.currentTime) || 0));
+  const clearScheduledAudio = () => {
+    for (const source of audioSources) {
+      try { source.stop(); } catch (_error) {}
+    }
+    audioSources.clear();
+    audioNextTime = 0;
+    firstVideoTimestamp = null;
+    videoAudioStartTime = 0;
+    audioTimestampScale = null;
+  };
   const release = () => {
     releasing = true;
     setLoading(false);
@@ -76,15 +92,12 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       timelineSocket.close();
       timelineSocket = null;
     }
-    for (const source of audioSources) {
-      try { source.stop(); } catch (_error) {}
-    }
-    audioSources.clear();
+    clearScheduledAudio();
     audioContext?.close().catch(() => {});
     audioContext = null;
     audioGain = null;
-    audioNextTime = 0;
     audioReady = null;
+    audioStalled = false;
     audioSampleRate = 8000;
     audioChannels = 1;
     audioTimestampScale = null;
@@ -110,6 +123,8 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       pendingTimelineSeek = null;
       if (disposed || paused || !Number.isFinite(position)) return;
       if (timelineSocket?.readyState !== WebSocket.OPEN) return;
+      expectedTimelinePosition = position;
+      debug('seek-requested', { position });
       timelineSocket.send(JSON.stringify({ action: 'seek', position }));
     }, 60);
   };
@@ -138,7 +153,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     status.textContent = 'Finished';
     debug('finished');
   };
-  const resume = async (time, preferredTransport = null) => {
+  const resume = async (time, preferredTransport = null, forceTimelineSeek = false) => {
     if (disposed) return;
     if (continuous && isControlledStream && timelineSocket?.readyState === WebSocket.OPEN) {
       const wanted = clip.start + Math.max(0, Math.floor(time));
@@ -146,6 +161,16 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       status.textContent = paused ? 'Resuming camera stream' : 'Seeking camera recording';
       setLoading(true);
       if (paused) {
+        // A timeline card selection may choose a different recording while
+        // the camera session is paused. Seek first, then resume, so the
+        // camera never emits old-position frames into the fresh UI state.
+        if (forceTimelineSeek) {
+          offset = Math.max(0, Math.floor(time));
+          expectedTimelinePosition = wanted;
+          streamStarting = true;
+          debug('seek-requested', { position: wanted });
+          timelineSocket.send(JSON.stringify({ action: 'seek', position: wanted }));
+        }
         paused = false;
         await audioContext?.resume();
         timelineSocket.send(JSON.stringify({ action: 'resume' }));
@@ -153,13 +178,20 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       } else {
         offset = Math.max(0, Math.floor(time));
         streamStarting = true;
-        video.pause();
+        // Keep the media element playing while its hidden buffer is replaced.
+        // Pausing here makes a successful timeline seek stop at its new point.
         queueTimelineSeek(wanted);
       }
       return;
     }
     const request = ++revision;
     release();
+    // A direct clip opens a distinct HTTP stream, so its protocol generation
+    // restarts at zero. Timeline seeks stay within one WebSocket and retain
+    // their generation for stale-frame rejection.
+    activeSegmentGeneration = -1;
+    expectedTimelinePosition = null;
+    discardSegment = false;
     video.parentElement.classList.add('camera-player--switching');
     streamStarting = true;
     if (isControlledStream) prepareAudio();
@@ -222,6 +254,14 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           if (typeof event.data === 'string') {
             try {
               const message = JSON.parse(event.data);
+              if (message.type === 'seeking') {
+                const position = Number(message.position);
+                if (Number.isFinite(position)) {
+                  expectedTimelinePosition = position;
+                  debug('seek-accepted', { position });
+                }
+                return;
+              }
               if (message.type === 'error') fail(new Error(message.message || 'Timeline playback failed'));
             } catch (error) {
               fail(error);
@@ -267,86 +307,185 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     await consumeNativeStream(response, request);
   };
   const consumeNativeStream = async (response, request) => {
-    const signal = streamController?.signal || controller.signal;
+    const signal = streamController?.signal;
+    if (!signal) throw new Error('Camera stream was not initialized');
     const MediaSourceType = window.MediaSource || window.ManagedMediaSource;
-    const mediaSource = new MediaSourceType();
-    streamObjectUrl = URL.createObjectURL(mediaSource);
-    video.src = streamObjectUrl;
-    video.load();
-    await once(mediaSource, 'sourceopen', signal);
-    if (disposed || request !== revision) return;
     const mime = [
       'video/mp4; codecs="avc1.64001f"',
       'video/mp4; codecs="avc1.4d401f"',
       'video/mp4; codecs="avc1.42e01e"',
     ].find(candidate => MediaSourceType.isTypeSupported(candidate));
     if (!mime) throw new Error('H.264 Media Source playback is unavailable');
-    const sourceBuffer = mediaSource.addSourceBuffer(mime);
-    sourceBuffer.mode = 'sequence';
     await audioReady;
+
+    let mediaSource = null;
+    let sourceBuffer = null;
+    let mediaEpoch = 0;
+    let frameConfirmationEpoch = -1;
+    let frameConfirmationTimer = null;
+    let frameConfirmationTimerEpoch = -1;
+    signal.addEventListener('abort', () => {
+      if (frameConfirmationTimer !== null) {
+        clearTimeout(frameConfirmationTimer);
+        frameConfirmationTimer = null;
+      }
+      frameConfirmationTimerEpoch = -1;
+      frameConfirmationEpoch = -1;
+    }, { once: true });
+    const resetAudioTimeline = () => {
+      clearScheduledAudio();
+    };
+    const createMediaPipeline = async () => {
+      if (frameConfirmationTimer !== null) clearTimeout(frameConfirmationTimer);
+      frameConfirmationTimer = null;
+      frameConfirmationTimerEpoch = -1;
+      const epoch = ++mediaEpoch;
+      const nextMediaSource = new MediaSourceType();
+      const nextUrl = URL.createObjectURL(nextMediaSource);
+      const previousUrl = streamObjectUrl;
+      // A SourceBuffer reset leaves Chromium's decode clock alive. Replacing
+      // the MediaSource gives a timeline seek a clean video epoch while the
+      // camera WebSocket remains the one active transport.
+      streamObjectUrl = nextUrl;
+      video.src = nextUrl;
+      video.load();
+      await once(nextMediaSource, 'sourceopen', signal);
+      if (disposed || request !== revision) {
+        URL.revokeObjectURL(nextUrl);
+        if (streamObjectUrl === nextUrl) streamObjectUrl = '';
+        return false;
+      }
+      const nextSourceBuffer = nextMediaSource.addSourceBuffer(mime);
+      nextSourceBuffer.mode = 'sequence';
+      mediaSource = nextMediaSource;
+      sourceBuffer = nextSourceBuffer;
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      return epoch;
+    };
+    if (!await createMediaPipeline()) return;
 
     const reader = response.body.getReader();
     let bytes = new Uint8Array();
     let magicRead = false;
     let videoStarted = false;
+    let videoPlaybackConfirmed = false;
     let videoRecords = 0;
     let streamComplete = false;
+    let segmentPosition = 0;
     let playbackError = null;
     let playbackPromise = null;
+    let activeMediaEpoch = 0;
     const queuedAudio = [];
+    const confirmVideoPlayback = (epoch = activeMediaEpoch) => {
+      if (
+        epoch !== mediaEpoch
+        || !videoStarted
+        || videoPlaybackConfirmed
+        || video.paused
+      ) return;
+      videoPlaybackConfirmed = true;
+      videoAudioStartTime = audioContext.currentTime + 0.08;
+      audioTimestampScale = inferTimestampScale(queuedAudio, audioSampleRate, audioChannels);
+      for (const item of queuedAudio.splice(0)) {
+        if (!firstVideoTimestamp || !item.timestamp || item.timestamp >= firstVideoTimestamp) {
+          scheduleAudio(item.kind, item.payload, item.timestamp);
+        }
+      }
+      debug('video-confirmed', { position: Math.round(video.currentTime * 100) / 100 });
+    };
+    const requestVideoConfirmation = () => {
+      const epoch = activeMediaEpoch;
+      if (
+        epoch !== mediaEpoch
+        || videoPlaybackConfirmed
+        || frameConfirmationEpoch === epoch
+      ) return;
+      frameConfirmationEpoch = epoch;
+      const finish = () => {
+        if (frameConfirmationEpoch === epoch) frameConfirmationEpoch = -1;
+        if (frameConfirmationTimer !== null && frameConfirmationTimerEpoch === epoch) {
+          clearTimeout(frameConfirmationTimer);
+          frameConfirmationTimer = null;
+          frameConfirmationTimerEpoch = -1;
+        }
+        confirmVideoPlayback(epoch);
+      };
+      if (typeof video.requestVideoFrameCallback === 'function') {
+        video.requestVideoFrameCallback(finish);
+        // Keep older Chromium/WebView builds from withholding audio forever
+        // if they expose the API but never invoke its callback for MSE.
+        frameConfirmationTimer = setTimeout(finish, 750);
+        frameConfirmationTimerEpoch = epoch;
+      } else {
+        finish();
+      }
+    };
+    // The browser can resolve video.play() before it has rendered a frame
+    // after replacing a MediaSource. Audio must wait for a real frame/time
+    // update instead of treating that promise as playback confirmation.
+    video.addEventListener('playing', requestVideoConfirmation, { signal });
+    video.addEventListener('timeupdate', requestVideoConfirmation, { signal });
     const startVideoPlayback = () => {
       if (videoStarted) return;
       videoStarted = true;
       debug('first-video');
       playbackPromise = video.play()
         .then(() => {
-          videoAudioStartTime = audioContext.currentTime + 0.08;
-          audioTimestampScale = inferTimestampScale(queuedAudio, audioSampleRate, audioChannels);
-          for (const item of queuedAudio.splice(0)) {
-            if (!firstVideoTimestamp || !item.timestamp || item.timestamp >= firstVideoTimestamp) {
-              scheduleAudio(item.kind, item.payload, item.timestamp);
-            }
-          }
+          debug('play-request-accepted');
+          requestVideoConfirmation();
         })
-        .catch(error => { playbackError = error; });
+        .catch(error => {
+          debug('play-failed', { name: error?.name || 'Error', message: messageFor(error) });
+          playbackError = error;
+        });
     };
     while (true) {
       const { value, done } = await reader.read();
       if (playbackError) throw playbackError;
       if (done) break;
       bytes = concatBytes(bytes, value);
-      while (bytes.length >= 4 && String.fromCharCode(...bytes.subarray(0, 4)) === 'TRS2') {
-        bytes = bytes.subarray(4);
+      while (bytes.length >= 4 && String.fromCharCode(...bytes.subarray(0, 4)) === 'TRS3') {
+        if (bytes.length < 16) break;
+        const segmentView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const generation = segmentView.getUint32(4);
+        const position = Number(segmentView.getBigUint64(8));
+        bytes = bytes.subarray(16);
+        const staleGeneration = generation <= activeSegmentGeneration;
+        const wrongPosition = continuous
+          && expectedTimelinePosition !== null
+          && position !== expectedTimelinePosition;
+        discardSegment = staleGeneration || wrongPosition;
+        if (discardSegment) {
+          debug('segment-discarded', {
+            generation,
+            position,
+            activeGeneration: activeSegmentGeneration,
+            expectedPosition: expectedTimelinePosition,
+          });
+          continue;
+        }
+        activeSegmentGeneration = generation;
+        segmentPosition = position;
+        expectedTimelinePosition = null;
         if (magicRead) {
           video.parentElement.classList.add('camera-player--switching');
-          video.pause();
-          if (sourceBuffer.updating) await once(sourceBuffer, 'updateend', signal);
-          if (sourceBuffer.buffered.length) {
-            sourceBuffer.remove(
-              sourceBuffer.buffered.start(0),
-              sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1),
-            );
-            await once(sourceBuffer, 'updateend', signal);
-          }
-          sourceBuffer.timestampOffset = 0;
-          video.currentTime = 0;
           videoStarted = false;
+          videoPlaybackConfirmed = false;
           videoRecords = 0;
           queuedAudio.splice(0);
-          for (const source of audioSources) {
-            try { source.stop(); } catch (_error) {}
-          }
-          audioSources.clear();
-          audioNextTime = 0;
-          firstVideoTimestamp = null;
+          resetAudioTimeline();
+          activeMediaEpoch = await createMediaPipeline();
+          if (!activeMediaEpoch) return;
           debug('stream-reset');
         }
+        if (continuous) offset = Math.max(0, segmentPosition - clip.start);
+        if (!activeMediaEpoch) activeMediaEpoch = mediaEpoch;
         magicRead = true;
-        debug('stream-header');
+        debug('stream-header', { generation, position: segmentPosition });
       }
       if (!magicRead) {
         if (bytes.length < 4) continue;
-        if (String.fromCharCode(...bytes.subarray(0, 4)) !== 'TRS2') {
+        if (String.fromCharCode(...bytes.subarray(0, 4)) !== 'TRS3') {
           throw new Error('Camera stream header is invalid');
         }
         continue;
@@ -360,6 +499,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
         if (bytes.length < 13 + size) break;
         const payload = bytes.slice(13, 13 + size);
         bytes = bytes.subarray(13 + size);
+        if (discardSegment) continue;
         if (kind === 1) {
           if (firstVideoTimestamp === null) firstVideoTimestamp = timestamp;
           await appendBuffer(sourceBuffer, payload, signal);
@@ -372,7 +512,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           }
         } else if (kind === 2 || kind === 4) {
           if (!queuedAudio.length && !audioNextTime) debug('first-audio', { kind });
-          if (videoStarted && !playbackError && !video.paused) scheduleAudio(kind, payload, timestamp);
+          if (videoPlaybackConfirmed && !playbackError && !video.paused) scheduleAudio(kind, payload, timestamp);
           else queuedAudio.push({ kind, payload, timestamp });
         } else if (kind === 5) {
           if (payload.length !== 5) throw new Error('Camera audio format is invalid');
@@ -383,6 +523,12 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
           debug('audio-format', { sampleRate: audioSampleRate, channels: audioChannels });
         } else if (kind === 3) {
           streamComplete = true;
+          debug('stream-complete', {
+            videoStarted,
+            videoConfirmed: videoPlaybackConfirmed,
+            currentTime: Math.round(video.currentTime * 100) / 100,
+            readyState: video.readyState,
+          });
           if (mediaSource.readyState === 'open' && !sourceBuffer.updating) {
             mediaSource.endOfStream();
           }
@@ -443,6 +589,7 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     scheduleAudioBuffer(buffer, timestamp);
   };
   const scheduleAudioBuffer = (buffer, timestamp) => {
+    if (audioStalled) return;
     const source = audioContext.createBufferSource();
     source.buffer = buffer;
     source.connect(audioGain);
@@ -492,7 +639,9 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
       if (!streamStarting) pause();
     });
     on(video, 'ended', () => {
-      if (!video.ended) return;
+      // video.load() during an in-place timeline seek can emit a late ended
+      // event from the detached MediaSource. It must not pause the new stream.
+      if (streamStarting || !video.ended) return;
       if (!continuous) offset = clip.duration;
       paused = true;
       release();
@@ -500,11 +649,23 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     });
     on(video, 'click', toggleRemotePlayback);
   }
-  on(video, 'playing', () => {
-    streamStarting = false;
-    paused = false;
+  const clearWaitingStatus = () => {
     if (waitingTimer !== null) clearTimeout(waitingTimer);
     waitingTimer = null;
+    if (status.textContent === 'Waiting for video') {
+      setLoading(false);
+      status.textContent = '';
+    }
+  };
+  on(video, 'playing', () => {
+    if (audioStalled) {
+      audioStalled = false;
+      audioContext?.resume().catch(() => {});
+    }
+    streamStarting = false;
+    paused = false;
+    lastPlaybackProgress = performance.now();
+    clearWaitingStatus();
     setLoading(false);
     status.textContent = '';
     requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -520,6 +681,15 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
     }
   });
   on(video, 'timeupdate', () => {
+    lastPlaybackProgress = performance.now();
+    clearWaitingStatus();
+    if (isControlledStream && progressReportedRevision !== revision) {
+      progressReportedRevision = revision;
+      debug('progress', {
+        position: Math.round(position() * 100) / 100,
+        readyState: video.readyState,
+      });
+    }
     // The old MediaSource can emit one last timeupdate after a timeline seek.
     // Do not let that stale position pull the ruler away from the user's drop.
     if (streamStarting || video.parentElement.classList.contains('camera-player--switching')) return;
@@ -531,17 +701,53 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   on(video, 'volumechange', syncAudioVolume);
   on(video, 'tuya-recordings-playblocked', () => { paused = true; status.textContent = 'Tap play to start'; });
   on(video, 'waiting', () => {
-    if (!video.getAttribute('src')) return;
-    if (waitingTimer !== null) clearTimeout(waitingTimer);
+    // MediaSource emits brief waiting events at normal fragment boundaries.
+    // Only surface a real stall: no video-time progress for 1.5 seconds.
+    if (
+      !video.getAttribute('src')
+      || streamStarting
+      || video.parentElement.classList.contains('camera-player--switching')
+      || waitingTimer !== null
+    ) return;
+    const progressAtWait = lastPlaybackProgress || performance.now();
     waitingTimer = setTimeout(() => {
       waitingTimer = null;
-      if (!disposed && !paused && video.getAttribute('src') && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
+      if (
+        !disposed
+        && !paused
+        && !streamStarting
+        && video.getAttribute('src')
+        && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
+        && lastPlaybackProgress <= progressAtWait
+      ) {
+        // Audio is carried separately. Once video has genuinely stalled,
+        // discard scheduled audio rather than letting sound run ahead of a
+        // frozen frame.
+        clearScheduledAudio();
+        audioStalled = true;
+        audioContext?.suspend().catch(() => {});
+        debug('audio-stalled');
         setLoading(true);
         status.textContent = 'Waiting for video';
       }
-    }, 350);
+    }, 1500);
   });
-  on(video, 'error', () => { if (!video.getAttribute('src')) return; paused = true; release(); status.textContent = `Playback unavailable: ${video.error?.message || 'video error'}`; });
+  on(video, 'error', () => {
+    if (continuous && isControlledStream) {
+      // A detached MediaSource can still dispatch its terminal error through
+      // the shared video element after a newer segment is playing. Native
+      // transport and SourceBuffer errors reject at their origin above; this
+      // anonymous event cannot safely identify the failed segment.
+      debug('stale-media-error-ignored');
+      return;
+    }
+    // Loading the fresh MediaSource during a timeline seek can emit a stale
+    // error from the detached buffer. The current stream is still valid.
+    if (!video.getAttribute('src') || streamStarting) return;
+    paused = true;
+    release();
+    status.textContent = 'Playback unavailable: ' + (video.error?.message || 'video error');
+  });
   if (clip.cached) {
     video.play().catch(() => { status.textContent = 'Tap play to start'; });
   } else if (options.autoplay) {
@@ -560,8 +766,9 @@ export function attachCameraPlayer(video, initialClip, signPath, options = {}) {
   dispose.playClip = (nextClip, time = 0) => {
     if (disposed) return;
     selectClip(nextClip);
-    paused = !(continuous && timelineSocket?.readyState === WebSocket.OPEN);
-    resume(Math.max(0, Number(time) || 0));
+    // Keep the actual session state. A paused timeline selection needs its
+    // own seek followed by resume; forcing paused false loses that seek.
+    void resume(Math.max(0, Number(time) || 0), null, continuous);
   };
   return dispose;
 }

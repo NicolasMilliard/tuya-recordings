@@ -1,4 +1,4 @@
-"""Play one captured TRS2 camera stream through the real browser player."""
+"""Play one captured TRS3 camera stream through the real browser player."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ def main() -> None:
     parser.add_argument("stream", type=Path)
     args = parser.parse_args()
     stream = args.stream.read_bytes()
-    if not stream.startswith(b"TRS2"):
-        raise RuntimeError("Captured browser stream has no TRS2 header")
+    if not stream.startswith(b"TRS3"):
+        raise RuntimeError("Captured browser stream has no TRS3 header")
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"

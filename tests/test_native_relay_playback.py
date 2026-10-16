@@ -885,7 +885,7 @@ def test_pause_and_resume_use_active_stream_without_stopping_transport():
     assert not playback._playback_paused
 
 
-def test_media_reset_preserves_continuous_rtp_reassembly_state():
+def test_media_reset_replaces_h264_reassembly_state_for_a_new_playback_stream():
     playback = session()
     video_parser = playback._rtp_parsers[1]
     audio_parser = playback._rtp_parsers[2]
@@ -896,5 +896,5 @@ def test_media_reset_preserves_continuous_rtp_reassembly_state():
 
     assert playback._rtp_parsers[1] is video_parser
     assert playback._rtp_parsers[2] is audio_parser
-    assert playback._h264 is h264
+    assert playback._h264 is not h264
     assert playback._media_frames.empty()

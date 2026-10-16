@@ -35,6 +35,16 @@ _THUMBNAIL_DEADLINE_GRACE_SECONDS = 1.0
 _STOP_WORKER = object()
 
 
+class _CancellationGroup:
+    """Expose several cancellation sources through the Event-style API."""
+
+    def __init__(self, *events: Any) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(event is not None and event.is_set() for event in self._events)
+
+
 @dataclass(slots=True)
 class _PlaybackWork:
     request: NativePlaybackRequest
@@ -100,6 +110,7 @@ class NativeRelayStreamWorker:
         self._requests: queue.Queue[object] = queue.Queue()
         self._state_lock = threading.Lock()
         self._closed = False
+        self._shutdown_event = threading.Event()
         self._thread = threading.Thread(
             target=self._thread_main,
             name=f"tuya-recordings-stream-{config.dev_id}",
@@ -127,6 +138,7 @@ class NativeRelayStreamWorker:
             if self._closed:
                 return
             self._closed = True
+            self._shutdown_event.set()
             while True:
                 try:
                     queued = self._requests.get_nowait()
@@ -197,9 +209,10 @@ class NativeRelayStreamWorker:
             assert isinstance(work, _PlaybackWork)
             failed = False
             try:
-                if self._closed or (
-                    work.cancel_event is not None and work.cancel_event.is_set()
-                ):
+                cancellation = _CancellationGroup(
+                    work.cancel_event, self._shutdown_event
+                )
+                if cancellation.is_set():
                     raise NativeRelayRuntimeError("Native playback was cancelled")
                 if playback is None:
                     playback = self._playback_factory(
@@ -210,7 +223,7 @@ class NativeRelayStreamWorker:
                 runtime = NativeRelayRuntimeSession(
                     self._config,
                     app_session=self._app_session,
-                    cancel_event=work.cancel_event,
+                    cancel_event=cancellation,
                     playback_factory=self._playback_factory,
                     media_secrets=self._media_secrets,
                     end_idle_timeout=self._end_idle_timeout,
@@ -263,6 +276,7 @@ class NativeRelayPlaybackWorker:
         self._requests: queue.Queue[object] = queue.Queue()
         self._state_lock = threading.Lock()
         self._closed = False
+        self._shutdown_event = threading.Event()
         self._thread = threading.Thread(
             target=self._thread_main,
             name=f"tuya-recordings-{config.dev_id}",
@@ -331,6 +345,7 @@ class NativeRelayPlaybackWorker:
             if self._closed:
                 return
             self._closed = True
+            self._shutdown_event.set()
             while True:
                 try:
                     queued = self._requests.get_nowait()
@@ -469,7 +484,7 @@ class NativeRelayPlaybackWorker:
                     runtime = NativeRelayRuntimeSession(
                         self._config,
                         app_session=self._app_session,
-                        cancel_event=work.cancel_event,
+                        cancel_event=self._cancellation_for(work),
                         playback_factory=self._playback_factory,
                         media_secrets=self._media_secrets,
                         end_idle_timeout=self._end_idle_timeout,
@@ -484,7 +499,7 @@ class NativeRelayPlaybackWorker:
                     runtime = NativeRelayRuntimeSession(
                         self._config,
                         app_session=self._app_session,
-                        cancel_event=work.cancel_event,
+                        cancel_event=self._cancellation_for(work),
                         playback_factory=self._playback_factory,
                         media_secrets=self._media_secrets,
                         end_idle_timeout=self._end_idle_timeout,
@@ -614,12 +629,17 @@ class NativeRelayPlaybackWorker:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
+    def _cancellation_for(
+        self,
+        work: _PlaybackWork | _InteractivePlaybackWork | _ThumbnailWork | _CatalogWork,
+    ) -> _CancellationGroup:
+        return _CancellationGroup(work.cancel_event, self._shutdown_event)
+
     def _work_cancelled(
         self,
         work: _PlaybackWork | _InteractivePlaybackWork | _ThumbnailWork | _CatalogWork,
     ) -> bool:
-        cancel_event = work.cancel_event
-        return self._closed or bool(cancel_event is not None and cancel_event.is_set())
+        return self._cancellation_for(work).is_set()
 
 
 class NativeRelayRuntimePool:
@@ -1010,7 +1030,13 @@ class NativeRelayRuntimeSession:
                 timeout=self.signaling_timeout + 15,
             )
             started = True
-            sink.started({"transport": "tuya-imm-simple", "generation": 1})
+            sink.started(
+                {
+                    "transport": "tuya-imm-simple",
+                    "generation": generation,
+                    "position": current.position,
+                }
+            )
             while not self._cancelled():
                 command = deferred_command
                 deferred_command = None
@@ -1084,6 +1110,7 @@ class NativeRelayRuntimeSession:
                         {
                             "transport": "tuya-imm-simple",
                             "generation": generation,
+                            "position": current.position,
                         }
                     )
                     paused = False

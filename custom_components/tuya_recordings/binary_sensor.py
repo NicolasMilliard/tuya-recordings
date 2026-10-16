@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import timedelta
+from threading import current_thread, main_thread
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -130,7 +131,7 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
         self._last_event_at: str | None = None
         self._last_event_type: str | None = None
         self._last_event_attributes: dict[str, Any] = {}
-        self._last_notification_values: dict[str, str | bytes] = {}
+        self._last_notification_values: dict[str, tuple[str | bytes, int | None]] = {}
         self._reset_cancel: Callable[[], None] | None = None
         self._reset_generation = 0
 
@@ -188,8 +189,18 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
         code = matching_ipc_alert_code(
             new_state.state, new_state.attributes, self.codes
         )
-        if code is not None:
-            self._record_notification(code, dict(new_state.attributes))
+        if code is None:
+            return
+        old_state = event.data.get("old_state")
+        if (
+            isinstance(old_state, State)
+            and matching_ipc_alert_code(
+                old_state.state, old_state.attributes, self.codes
+            ) == code
+            and dict(old_state.attributes) == dict(new_state.attributes)
+        ):
+            return
+        self._record_notification(code, dict(new_state.attributes))
 
     @callback
     def _handle_tuya_device_update(
@@ -213,9 +224,18 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
             raw_value = device.status.get(status_code)
             if not isinstance(raw_value, (str, bytes)) or raw_value in ("", b""):
                 continue
-            if raw_value == self._last_notification_values.get(status_code):
+            # Tuya may emit the same alert payload for distinct detections.
+            # The DP timestamp identifies a new camera notification while the
+            # payload alone protects against duplicate dispatcher callbacks.
+            timestamp = (
+                dp_timestamps.get(status_code)
+                if dp_timestamps and status_code in dp_timestamps
+                else None
+            )
+            notification_value = (raw_value, timestamp)
+            if notification_value == self._last_notification_values.get(status_code):
                 continue
-            self._last_notification_values[status_code] = raw_value
+            self._last_notification_values[status_code] = notification_value
             payload = decode_notification_message(raw_value)
             if payload is None:
                 continue
@@ -224,14 +244,19 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
                 continue
             attributes = notification_metadata(payload)
             attributes["notification_dp"] = status_code
-            if dp_timestamps and status_code in dp_timestamps:
-                attributes["dp_timestamp"] = dp_timestamps[status_code]
+            if timestamp is not None:
+                attributes["dp_timestamp"] = timestamp
             self._record_notification(code, attributes)
             return
 
     @callback
     def _record_notification(self, code: str, attributes: Mapping[str, Any]) -> None:
         """Record a detection, or honor an explicit clear from the camera."""
+        if current_thread() is not main_thread():
+            self.hass.loop.call_soon_threadsafe(
+                self._record_notification, code, dict(attributes)
+            )
+            return
         self._cancel_reset()
         self._last_event_at = dt_util.utcnow().isoformat()
         self._last_event_type = code
@@ -253,6 +278,11 @@ class TuyaRecordingAlertBinarySensor(BinarySensorEntity):
     @callback
     def _async_reset_after_timeout(self, generation: int) -> None:
         """Clear a detection indicator unless a newer event replaced it."""
+        if current_thread() is not main_thread():
+            self.hass.loop.call_soon_threadsafe(
+                self._async_reset_after_timeout, generation
+            )
+            return
         if generation != self._reset_generation:
             return
         self._reset_cancel = None

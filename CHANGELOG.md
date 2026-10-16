@@ -1,5 +1,23 @@
 # Changelog
 
+## Tuya Recordings v0.4.2 (2026-10-16)
+
+Native playback and timeline reliability release.
+
+### Highlights
+
+- Makes uncached SD-card playback use one serialized camera session with
+  browser-safe video and audio remuxing, without video transcoding.
+- Reworks timeline seeking so a completed pointer interaction seeks to the
+  selected wall-clock position and resumes playback from that position.
+- Keeps the player surface stable while a new native playback stream starts,
+  and records detailed browser-side playback diagnostics for troubleshooting.
+- Adds Smart Life and Tuya Smart account-app selection to the QR setup flow.
+- Makes motion and person history available through a camera event entity while
+  retaining the existing Motion detected and Person detected binary sensors.
+- Validates setup options and bounds camera background work through a
+  serialized, one-camera-at-a-time dispatcher.
+
 ## Tuya Recordings v0.4.1.4 (2026-10-05)
 
 Timeline playback seek correction.

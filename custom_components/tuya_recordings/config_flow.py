@@ -25,7 +25,6 @@ from .const import (
     CONF_MEDIA_VIEW_RECORDINGS_ORDER,
     CONF_NATIVE_APP_SESSION,
     CONF_REGION,
-    CONF_THUMBNAIL_SYNC_ENABLED,
     DEFAULT_ALERT_RESET_SECONDS,
     DEFAULT_APP_PROFILE,
     DEFAULT_CATALOG_SYNC_MINUTES,
@@ -81,7 +80,6 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
                 ],
                 CONF_ALERT_RESET_SECONDS: user_input[CONF_ALERT_RESET_SECONDS],
                 CONF_CATALOG_SYNC_MINUTES: DEFAULT_CATALOG_SYNC_MINUTES,
-                CONF_THUMBNAIL_SYNC_ENABLED: True,
             }
             if not await self._async_begin_native_authorization(
                 user_input[CONF_REGION], user_input[CONF_APP_PROFILE]
@@ -290,6 +288,37 @@ def _validate_media_storage_path(value: str) -> str:
 def _validate_form_input(user_input: dict[str, Any]) -> dict[str, str]:
     if user_input.get(CONF_APP_PROFILE, DEFAULT_APP_PROFILE) not in APP_PROFILE_LABELS:
         return {CONF_APP_PROFILE: "invalid_app_profile"}
+    if CONF_REGION in user_input and user_input[CONF_REGION] not in REGION_LABELS:
+        return {CONF_REGION: "invalid_value"}
+    if (
+        CONF_MEDIA_VIEW_RECORDINGS_ORDER in user_input
+        and user_input[CONF_MEDIA_VIEW_RECORDINGS_ORDER]
+        not in MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS
+    ):
+        return {CONF_MEDIA_VIEW_RECORDINGS_ORDER: "invalid_value"}
+    if (
+        CONF_MEDIA_SYNC_ENABLED in user_input
+        and not isinstance(user_input[CONF_MEDIA_SYNC_ENABLED], bool)
+    ):
+        return {CONF_MEDIA_SYNC_ENABLED: "invalid_value"}
+    for key, minimum, maximum in (
+        (CONF_LOOKBACK_DAYS, 0, 31),
+        (CONF_CATALOG_SYNC_MINUTES, 15, 1440),
+        (CONF_MEDIA_SYNC_HOURS, 0, 744),
+        (CONF_ALERT_RESET_SECONDS, 5, 3600),
+    ):
+        if key not in user_input:
+            continue
+        value = user_input[key]
+        if isinstance(value, bool):
+            return {key: "invalid_value"}
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return {key: "invalid_value"}
+        if not minimum <= value <= maximum:
+            return {key: "invalid_value"}
+        user_input[key] = value
     try:
         user_input[CONF_MEDIA_STORAGE_PATH] = _validate_media_storage_path(
             user_input.get(CONF_MEDIA_STORAGE_PATH, "")

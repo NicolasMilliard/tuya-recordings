@@ -19,6 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION = ROOT / "custom_components" / "tuya_recordings"
 
 
+def test_english_translation_matches_source_strings():
+    source = json.loads((INTEGRATION / "strings.json").read_text(encoding="utf-8"))
+    english = json.loads(
+        (INTEGRATION / "translations" / "en.json").read_text(encoding="utf-8")
+    )
+
+    assert english == source
+
+
 def test_native_transport_is_vendored_and_not_downloaded_from_pypi():
     manifest = json.loads((INTEGRATION / "manifest.json").read_text(encoding="utf-8"))
     requirements = manifest.get("requirements", [])
@@ -131,6 +140,7 @@ def test_panel_uses_inline_native_player_and_always_renders_pause_control():
     assert "await this.loadData();" in panel
     assert 'class="clip-player"' in panel
     assert "attachCameraPlayer(video, this.selectedClip" in panel
+    assert "camera-player.js?v=20261016-timeline-epoch-31" in panel
     assert "stream_transport === \"native\"" in panel
     assert "new window.Plyr(video" in player
     assert "'mute', 'volume', 'fullscreen'" in player
@@ -142,6 +152,27 @@ def test_panel_uses_inline_native_player_and_always_renders_pause_control():
     assert ".timeline-player > * { position: absolute; inset: 0; }" in panel
     assert "contain: layout paint" in panel
     assert "if (streamStarting || video.parentElement.classList.contains('camera-player--switching')) return;" in player
+    assert "if (streamStarting || !video.ended) return;" in player
+    assert "Only surface a real stall" in player
+    assert "lastPlaybackProgress <= progressAtWait" in player
+    assert "}, 1500);" in player
+    assert "Pausing here makes a successful timeline seek stop" in player
+    assert "const createMediaPipeline = async () =>" in player
+    assert "A SourceBuffer reset leaves Chromium's decode clock alive" in player
+    assert "if (!await createMediaPipeline()) return;" in player
+    assert "debug('video-confirmed'" in player
+    assert "const confirmVideoPlayback = (epoch = activeMediaEpoch) =>" in player
+    assert "video.requestVideoFrameCallback(finish);" in player
+    assert "epoch !== mediaEpoch" in player
+    assert "const clearScheduledAudio = () =>" in player
+    assert "if (audioStalled) return;" in player
+    assert "audioContext?.suspend().catch(() => {});" in player
+    assert "debug('audio-stalled');" in player
+    assert "audioContext?.resume().catch(() => {});" in player
+    assert "expectPlaybackAt" in panel
+    assert "expectedPlaybackTime" in panel
+    assert "streamController?.signal || controller.signal" not in player
+    assert "Camera stream was not initialized" in player
 
 
 def test_native_player_has_one_seek_dispatch_path():

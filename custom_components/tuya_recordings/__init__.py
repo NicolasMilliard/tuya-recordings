@@ -9,7 +9,7 @@ from pathlib import Path
 import voluptuous as vol
 from homeassistant.components import frontend as ha_frontend
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, State, callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
@@ -72,9 +72,6 @@ DATA_THUMBNAIL_SYNC_REQUIRE_MEDIA = "thumbnail_sync_require_media"
 DATA_THUMBNAIL_SYNC_REFRESH_CATALOG = "thumbnail_sync_refresh_catalog"
 DATA_THUMBNAIL_SYNC_RETRY_AFTER = "thumbnail_sync_retry_after"
 DATA_CAMERA_RESUME_TIMER = "camera_resume_timer"
-DATA_RECORDING_TRIGGER_TIMER = "recording_trigger_timer"
-DATA_RECORDING_TRIGGER_LAST = "recording_trigger_last"
-DATA_RECORDING_TRIGGER_UNSUB = "recording_trigger_unsub"
 CAMERA_RESUME_BACKGROUND_DELAY = 30
 NATIVE_SESSION_IMPORT_FILE = ".tuya_recordings_native_session_import.json"
 STALE_ENTRY_KEYS = {
@@ -219,7 +216,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await async_register_frontend(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_schedule_media_sync(hass, entry)
-    _async_setup_recording_triggers(hass, entry)
     return True
 
 
@@ -234,18 +230,6 @@ def _async_scrub_legacy_entry_data(hass: HomeAssistant, entry: ConfigEntry, entr
         for key, value in entry.options.items()
         if key not in STALE_ENTRY_KEYS and key != CONF_THUMBNAIL_SYNC_ENABLED
     }
-    media_sync_enabled = bool(
-        clean_options.get(
-            CONF_MEDIA_SYNC_ENABLED,
-            clean_data.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED),
-        )
-    )
-    persisted_pause = clean_options.get(
-        CONF_CLOUD_ACTIVITY_PAUSED,
-        clean_data.get(CONF_CLOUD_ACTIVITY_PAUSED, False),
-    )
-    if not media_sync_enabled and persisted_pause:
-        clean_options[CONF_CLOUD_ACTIVITY_PAUSED] = False
     if clean_data != dict(entry.data) or clean_options != dict(entry.options):
         hass.config_entries.async_update_entry(entry, data=clean_data, options=clean_options, version=5)
 
@@ -255,8 +239,11 @@ def _entry_runtime_data(entry: ConfigEntry) -> dict:
     runtime = {**entry.data, **entry.options}
     media_sync_enabled = bool(runtime.get(CONF_MEDIA_SYNC_ENABLED, DEFAULT_MEDIA_SYNC_ENABLED))
     runtime[CONF_THUMBNAIL_SYNC_ENABLED] = media_sync_enabled
+    # Pausing camera work is meaningful in both modes. In the default
+    # timeline mode it stops catalog refresh and live SD playback; with
+    # caching enabled it also stops cache and thumbnail work.
     runtime[CONF_CLOUD_ACTIVITY_PAUSED] = bool(
-        media_sync_enabled and runtime.get(CONF_CLOUD_ACTIVITY_PAUSED, False)
+        runtime.get(CONF_CLOUD_ACTIVITY_PAUSED, False)
     )
     return runtime
 
@@ -314,7 +301,6 @@ async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None
     client: TuyaRecordingsClient = entry_data["client"]
     await hass.async_add_executor_job(client.update_options, _entry_runtime_data(entry))
     _async_schedule_media_sync(hass, entry)
-    _async_setup_recording_triggers(hass, entry)
     if client.cloud_activity_paused:
         await async_pause_camera_work(hass, entry.entry_id)
     async_dispatcher_send(hass, SIGNAL_RECORDINGS_UPDATED, entry.entry_id)
@@ -332,8 +318,6 @@ async def async_pause_camera_work(hass: HomeAssistant, entry_id: str) -> None:
     entry_data.pop(DATA_THUMBNAIL_SYNC_REFRESH_CATALOG, None)
     entry_data[DATA_THUMBNAIL_SYNC_RETRY_AFTER] = _thumbnail_background_cooldown_until(hass)
     if timer := entry_data.pop(DATA_CAMERA_RESUME_TIMER, None):
-        timer()
-    if timer := entry_data.pop(DATA_RECORDING_TRIGGER_TIMER, None):
         timer()
 
 
@@ -357,8 +341,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if isinstance(entry_data, dict) and isinstance(entry_data.get("client"), TuyaRecordingsClient):
         _async_cancel_media_sync_schedule(entry_data)
-        if unsubscribe := entry_data.pop(DATA_RECORDING_TRIGGER_UNSUB, None):
-            unsubscribe()
         await hass.async_add_executor_job(entry_data["client"].close)
         await async_pause_camera_work(hass, entry.entry_id)
     hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
@@ -528,107 +510,6 @@ def _async_cancel_media_sync_schedule(entry_data: dict) -> None:
     """Cancel every timer owned by optional local media caching."""
     for cancel in entry_data.pop(DATA_MEDIA_SYNC_SCHEDULE, []):
         cancel()
-
-
-def _async_setup_recording_triggers(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
-    if not isinstance(entry_data, dict):
-        return
-    if unsubscribe := entry_data.pop(DATA_RECORDING_TRIGGER_UNSUB, None):
-        unsubscribe()
-    # HA entity changes are noisy and not reliable proof that a new SD clip
-    # exists. Cache mode uses one bounded timer-driven command path instead.
-    return
-
-
-def _recording_trigger_entity_ids(hass: HomeAssistant, camera_tokens: set[str] | None = None) -> list[str]:
-    return _recording_trigger_entity_ids_from_states(hass.states.async_all(), camera_tokens)
-
-
-def _recording_trigger_entity_ids_from_states(states: list[State], camera_tokens: set[str] | None = None) -> list[str]:
-    camera_tokens = camera_tokens or _recording_trigger_camera_tokens(states)
-    return sorted(
-        state.entity_id
-        for state in states
-        if _is_recording_trigger_entity(state, camera_tokens)
-    )
-
-
-def _client_camera_tokens(client: TuyaRecordingsClient) -> set[str]:
-    try:
-        index = client.cached_camera_index()
-    except Exception:
-        return set()
-    return {
-        token
-        for camera in index.get("cameras", [])
-        if isinstance(camera, dict)
-        for token in {_base_camera_token(str(camera.get("name") or ""))}
-        if token
-    }
-
-
-def _recording_trigger_camera_tokens(states: list[State]) -> set[str]:
-    tokens: set[str] = set()
-    for state in states:
-        entity_id = state.entity_id.lower()
-        name = str(state.attributes.get("friendly_name") or "").lower()
-        domain, _, object_id = entity_id.partition(".")
-        if domain == "camera":
-            tokens.add(_base_camera_token(object_id))
-        elif domain == "sensor" and "camera_display_status" in entity_id:
-            tokens.add(_base_camera_token(object_id.removesuffix("_camera_display_status")))
-        elif domain == "sensor" and "sd_storage" in entity_id:
-            tokens.add(_base_camera_token(object_id.removesuffix("_sd_storage").removesuffix("_local")))
-        elif domain == "sensor" and "camera display status" in name:
-            tokens.add(_base_camera_token(name.replace("camera display status", "")))
-        elif domain == "sensor" and "sd storage" in name:
-            tokens.add(_base_camera_token(name.replace("sd storage", "").replace("local", "")))
-    return {token for token in tokens if token}
-
-
-def _base_camera_token(value: str) -> str:
-    token = value.strip().lower().replace(" ", "_")
-    while token and token[-1].isdigit():
-        token = token[:-1].rstrip("_")
-    return token
-
-
-def _is_recording_trigger_entity(state: State, camera_tokens: set[str] | None = None) -> bool:
-    entity_id = state.entity_id.lower()
-    name = str(state.attributes.get("friendly_name") or "").lower()
-    text = f"{entity_id} {name}"
-    domain = entity_id.split(".", 1)[0]
-    camera_tokens = camera_tokens or set()
-
-    matches_camera = not camera_tokens or any(token in text for token in camera_tokens)
-    if not matches_camera:
-        return False
-    if domain == "event" and any(marker in text for marker in ("doorbell", "motion", "alarm")):
-        return True
-    if domain == "sensor" and ("camera_display_status" in entity_id or "camera display status" in name):
-        return True
-    if domain == "sensor" and ("sd_storage" in entity_id or "sd storage" in name):
-        return True
-    return False
-
-
-def _state_change_suggests_recording(old_state: State | None, new_state: State | None) -> bool:
-    if old_state is None or new_state is None:
-        return False
-    if new_state.state in {"unknown", "unavailable"} or old_state.state == new_state.state:
-        return False
-
-    entity_id = new_state.entity_id.lower()
-    name = str(new_state.attributes.get("friendly_name") or "").lower()
-    domain = entity_id.split(".", 1)[0]
-    if domain == "event":
-        return True
-    if "camera_display_status" in entity_id or "camera display status" in name:
-        return new_state.state.lower() == "recording"
-    if "sd_storage" in entity_id or "sd storage" in name:
-        return True
-    return False
 
 
 async def _async_run_sync_cycle(hass: HomeAssistant, entry_id: str, reason: str) -> None:

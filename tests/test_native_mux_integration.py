@@ -18,8 +18,8 @@ from custom_components.tuya_recordings.lib.native_mux import (
     BROWSER_STREAM_AUDIO_PCM_S16LE,
     BROWSER_STREAM_AUDIO_FORMAT,
     BROWSER_STREAM_END,
-    BROWSER_STREAM_MAGIC,
     BROWSER_STREAM_VIDEO,
+    browser_stream_header,
     NativePlaybackBrowserStreamMuxer,
     NativePlaybackFmp4StreamMuxer,
 )
@@ -274,7 +274,7 @@ def test_browser_stream_copies_h264_and_preserves_pcm_s16le(tmp_path):
         )
         muxer.handle_event(_event(NativePlaybackFrameType.FINISHED))
 
-    assert chunks[0] == BROWSER_STREAM_MAGIC
+    assert chunks[0] == browser_stream_header()
     records = []
     for chunk in chunks[1:]:
         kind = chunk[0]

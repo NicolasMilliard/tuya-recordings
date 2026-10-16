@@ -56,6 +56,19 @@ def test_playback_pause_clears_queued_work_without_using_master_pause():
     assert client.cloud_activity_paused is False
 
 
+def test_newer_request_cancels_a_pending_playback_before_it_gets_camera_lock():
+    domain_data = {}
+    first_generation, first_stop = recordings_http._claim_playback_handoff(domain_data)
+    second_generation, second_stop = recordings_http._claim_playback_handoff(domain_data)
+    third_generation, third_stop = recordings_http._claim_playback_handoff(domain_data)
+
+    assert (first_generation, second_generation, third_generation) == (1, 2, 3)
+    assert first_stop.is_set() is True
+    assert second_stop.is_set() is True
+    assert third_stop.is_set() is False
+    assert domain_data[recordings_http._DATA_PLAYBACK_STOP] is third_stop
+
+
 def test_superseded_playback_cannot_resume_background_work():
     client = TuyaRecordingsClient({})
     entry_data = {"client": client}

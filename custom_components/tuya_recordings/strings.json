@@ -36,7 +36,8 @@
       "tuya_required": "Install and configure the official Tuya integration first.",
       "path_not_absolute": "Use an absolute Home Assistant path, such as /media/tuya_recordings.",
       "path_not_allowed": "Use a private storage folder under /media. Do not use /media itself, /config, or /config/www.",
-      "native_authorization_start_failed": "Could not start camera authorization. No retry was made."
+      "native_authorization_start_failed": "Could not start camera authorization. No retry was made.",
+      "invalid_value": "Enter a value within the displayed range."
     },
     "abort": {
       "already_configured": "This Tuya account is already configured.",
@@ -48,7 +49,7 @@
     "step": {
       "init": {
         "title": "Tuya Recordings options",
-        "description": "Catalogs and thumbnails update automatically. Event clips use the camera's native JPEG; other clips use the first frame of a brief playback stream. Use the master pause switch to suspend camera activity. Full-video caching is optional.",
+        "description": "The SD-card catalog updates automatically. When pre-cache recordings is enabled, cached clips receive local thumbnails. Use the master pause switch to suspend camera activity. Full-video caching is optional.",
         "data": {
           "lookback_days": "Days to check (0 = all)",
           "catalog_sync_minutes": "Background catalog interval (minutes)",

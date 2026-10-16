@@ -20,6 +20,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     this.calendarOpen = false;
     this.calendarMonth = "";
     this.timeline = null;
+    this.pendingTimelineRender = false;
     this.handleRouteChange = async () => {
       this.syncRouteFromHash();
       if (this.selectedClip) {
@@ -184,6 +185,13 @@ class TuyaRecordingsPanel extends HTMLElement {
   }
 
   render() {
+    // Rebuilding the shadow DOM during a held scrub destroys the active
+    // window-level pointer listener. Defer that rebuild until mouse-up.
+    if (this.timeline?.isDragging?.()) {
+      this.pendingTimelineRender = true;
+      return;
+    }
+    this.pendingTimelineRender = false;
     this.disposePlayer?.();
     this.disposePlayer = null;
     this.timeline?.destroy?.();
@@ -231,15 +239,17 @@ class TuyaRecordingsPanel extends HTMLElement {
         .timeline-heading strong { font-size: 13px; font-weight: 500; color: var(--secondary-text-color); }
         .timeline-heading span { font-size: 18px; line-height: 1.2; font-variant-numeric: tabular-nums; color: var(--primary-text-color); }
         .time-ruler-wrap { position: relative; height: 88px; border-top: 1px solid var(--divider-color); border-bottom: 1px solid var(--divider-color); background: var(--secondary-background-color, #f3f4f6); overflow: hidden; }
-        .time-ruler { width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scrollbar-width: none; touch-action: pan-y; cursor: grab; }
+        .time-ruler { width: 100%; height: 100%; overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scrollbar-width: none; touch-action: none; cursor: grab; user-select: none; }
         .time-ruler:active, .time-ruler[data-dragging="true"] { cursor: grabbing; user-select: none; }
         .time-ruler::-webkit-scrollbar { display: none; }
         .time-ruler-content { position: relative; width: 2880px; height: 100%; margin-inline: calc(50% - 1px); background-image: repeating-linear-gradient(to right, transparent 0, transparent 19px, color-mix(in srgb, var(--secondary-text-color) 28%, transparent) 19px, color-mix(in srgb, var(--secondary-text-color) 28%, transparent) 20px); background-size: 120px 12px; background-position: 0 32px; background-repeat: repeat-x; }
         .timeline-hour { position: absolute; top: 9px; translate: -50% 0; font-size: 11px; color: var(--secondary-text-color); font-variant-numeric: tabular-nums; white-space: nowrap; }
         .timeline-hour::after { content: ""; position: absolute; left: 50%; top: 19px; width: 1px; height: 18px; background: color-mix(in srgb, var(--secondary-text-color) 60%, transparent); }
         .recording-lane { position: absolute; inset: 49px 0 auto; height: 24px; background: color-mix(in srgb, var(--divider-color) 55%, transparent); }
-        .recording-segment { position: absolute; top: 3px; height: 18px; min-width: 4px; border: 0; border-radius: 2px; padding: 0; background: #ff592a; cursor: pointer; box-shadow: inset 0 0 0 1px #e2471d; }
+        .recording-segment { pointer-events: none; position: absolute; top: 3px; height: 18px; min-width: 4px; border: 0; border-radius: 2px; padding: 0; background: #ff592a; box-shadow: inset 0 0 0 1px #e2471d; }
         .recording-segment:hover, .recording-segment:focus-visible { filter: brightness(1.08); outline: 2px solid var(--primary-text-color); outline-offset: 1px; }
+        .person-detection-marker { pointer-events: none; position: absolute; z-index: 2; top: -5px; width: 3px; height: 34px; translate: -1px 0; background: #ef3e3e; box-shadow: 0 0 0 1px color-mix(in srgb, #ef3e3e 55%, transparent); }
+        .timeline-legend b { width: 8px; height: 8px; border-radius: 50%; background: #ef3e3e; }
         .timeline-playhead { pointer-events: none; position: absolute; z-index: 3; left: 50%; top: 0; bottom: 0; width: 2px; translate: -1px 0; background: #ff592a; box-shadow: 0 0 0 1px color-mix(in srgb, var(--card-background-color) 70%, transparent); }
         .timeline-playhead::before { content: ""; position: absolute; top: 0; left: 50%; translate: -50% 0; width: 0; height: 0; border-left: 7px solid transparent; border-right: 7px solid transparent; border-top: 9px solid #ff592a; }
         .timeline-legend { display: flex; justify-content: center; align-items: center; gap: 8px; min-height: 27px; padding: 5px 14px 0; font-size: 12px; color: var(--secondary-text-color); }
@@ -707,17 +717,27 @@ class TuyaRecordingsPanel extends HTMLElement {
           <div id="recording-timeline" class="time-ruler" role="slider" tabindex="0" aria-label="Recording timeline" aria-valuemin="0" aria-valuemax="86400">
             <div class="time-ruler-content">
               ${this.renderTimelineHours()}
-              <div class="recording-lane">${this.renderRecordingSegments(ranges)}</div>
+              <div class="recording-lane">${this.renderRecordingSegments(ranges)}${this.renderPersonDetectionMarkers(this.camera?.person_detections || [])}</div>
             </div>
           </div>
           <div class="timeline-playhead" aria-hidden="true"></div>
         </div>
-        <div class="timeline-legend">${ranges.length ? '<i></i><span>Recorded video</span><span>Drag to choose a time</span>' : '<span>No recorded video on this day</span>'}</div>
+        <div class="timeline-legend">${ranges.length ? '<i></i><span>Recorded video</span><b></b><span>Person detected</span><span>Drag to browse, tap a recording to play</span>' : '<span>No recorded video on this day</span>'}</div>
       </div>
     </section>`;
   }
 
   timelineInitialTime(ranges, dayStart) {
+    // A panel refresh must preserve the exact point under the fixed playhead.
+    // Without this, any render during an active scrub jumps back to a default.
+    const anchor = this.timelineAnchor;
+    if (
+      anchor?.camera === this.selectedCamera
+      && anchor.date === this.selectedDate
+      && Number.isFinite(anchor.time)
+    ) {
+      return Math.max(dayStart, Math.min(dayStart + 86399, anchor.time));
+    }
     const selected = this.selectedClip
       && this.selectedClip.dev_id === this.selectedCamera
       && this.selectedClip.date === this.selectedDate
@@ -756,6 +776,18 @@ class TuyaRecordingsPanel extends HTMLElement {
       const left = ((start - dayStart) / 86400) * 100;
       const width = Math.max(0.14, ((end - start) / 86400) * 100);
       return `<button class="recording-segment" type="button" data-start="${range.start}" data-end="${range.end}" style="left:${left}%;width:${width}%" aria-label="Play recording at ${this.escape(this.formatTime(range.start))}"></button>`;
+    }).join("");
+  }
+
+  renderPersonDetectionMarkers(detections) {
+    const dayStart = new Date(`${this.selectedDate}T00:00:00`).getTime() / 1000;
+    const dayEnd = dayStart + 86400;
+    return detections.map((timestamp) => {
+      const detectedAt = Number(timestamp);
+      if (!Number.isFinite(detectedAt) || detectedAt < dayStart || detectedAt >= dayEnd) return "";
+      const left = ((detectedAt - dayStart) / 86400) * 100;
+      const label = this.escape(`Person detected at ${this.formatTime(detectedAt)}`);
+      return `<span class="person-detection-marker" style="left:${left}%" title="${label}" aria-label="${label}"></span>`;
     }).join("");
   }
 
@@ -867,9 +899,10 @@ class TuyaRecordingsPanel extends HTMLElement {
     });
     this.shadowRoot.getElementById("pause-toggle")?.addEventListener("click", () => this.toggleCameraActivityPause());
     this.shadowRoot.getElementById("timeline-play")?.addEventListener("click", async () => {
-      const ranges = this.recordingRanges;
-      const range = ranges[ranges.length - 1];
-      if (range) await this.openTimelineRange(range, range.start);
+      const time = this.timeline?.getTime?.();
+      if (!Number.isFinite(time)) return;
+      const range = this.rangeForTime(time);
+      if (range) await this.openTimelineRange(range, time);
     });
     this.shadowRoot.querySelectorAll(".clip").forEach((button) => {
       const open = async (event) => {
@@ -897,7 +930,7 @@ class TuyaRecordingsPanel extends HTMLElement {
     const revision = this.playbackRevision;
     try {
       this.debugPlayback("player-import", this.selectedClip);
-      const { attachCameraPlayer } = await import('/tuya_recordings_static/camera-player.js?v=20261002-timeline-controller-2');
+      const { attachCameraPlayer } = await import('/tuya_recordings_static/camera-player.js?v=20261016-timeline-epoch-31');
       if (revision !== this.playbackRevision || !video.isConnected) return;
       this.disposePlayer?.();
       this.disposePlayer = null;
@@ -1069,6 +1102,7 @@ class TuyaRecordingsPanel extends HTMLElement {
       this.selectedClip = clip;
       this.error = "";
       this.debugPlayback("click", clip);
+      this.timeline?.expectPlaybackAt?.(clip.play_time);
       this.disposePlayer.playClip(clip, clip.play_time - clip.start);
       this.timeline?.setTime?.(clip.play_time);
       return;
@@ -1087,32 +1121,50 @@ class TuyaRecordingsPanel extends HTMLElement {
     let scrollFrame = 0;
     let dragging = false;
     let dragMoved = false;
-    let suppressClick = false;
     let pointerId = null;
     let dragStartX = 0;
     let dragStartScroll = 0;
     let followPlayback = true;
+    let playbackUpdatesSuspended = false;
+    let expectedPlaybackTime = null;
     const scrollWidth = () => Math.max(1, container.scrollWidth - container.clientWidth);
     const epochAtPlayhead = () => dayStart + (container.scrollLeft / scrollWidth()) * 86400;
-    const applyTime = (epoch) => {
-      container.scrollLeft = Math.max(0, Math.min(scrollWidth(), ((epoch - dayStart) / 86400) * scrollWidth()));
+    const displayTime = (epoch) => {
       const clock = this.shadowRoot.getElementById("timeline-clock");
       if (clock) clock.textContent = this.formatTime(epoch);
       container.setAttribute("aria-valuenow", String(Math.max(0, Math.min(86400, Math.round(epoch - dayStart)))));
+    };
+    const applyTime = (epoch) => {
+      container.scrollLeft = Math.max(0, Math.min(scrollWidth(), ((epoch - dayStart) / 86400) * scrollWidth()));
+      displayTime(epoch);
     };
     const setTime = (epoch) => {
       if (!dragging && followPlayback) applyTime(epoch);
     };
     const onScroll = () => {
       cancelAnimationFrame(scrollFrame);
-      scrollFrame = requestAnimationFrame(() => setTime(epochAtPlayhead()));
+      scrollFrame = requestAnimationFrame(() => {
+        const epoch = epochAtPlayhead();
+        if (dragging) displayTime(epoch);
+        else setTime(epoch);
+      });
     };
     const onKeyDown = (event) => {
       if (!['ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown'].includes(event.key)) return;
       event.preventDefault();
+      // Keyboard navigation must retain the chosen playhead just like a drag;
+      // a residual update from the previous stream cannot pull it back.
+      followPlayback = false;
+      playbackUpdatesSuspended = true;
       const direction = event.key === 'ArrowLeft' || event.key === 'PageDown' ? -1 : 1;
       const step = event.key.startsWith('Page') ? 3600 : 600;
-      applyTime(epochAtPlayhead() + direction * step);
+      const epoch = epochAtPlayhead() + direction * step;
+      applyTime(epoch);
+      this.timelineAnchor = {
+        camera: this.selectedCamera,
+        date: this.selectedDate,
+        time: epoch,
+      };
     };
     const epochAtPointer = (clientX) => {
       const bounds = container.getBoundingClientRect();
@@ -1122,28 +1174,39 @@ class TuyaRecordingsPanel extends HTMLElement {
     };
     const playAt = async (epoch) => {
       const range = this.rangeForTime(epoch, ranges);
-      if (range && range.start <= epoch && epoch < range.end) {
-        await this.openTimelineRange(range, epoch);
+      if (!range) {
+        this.disposePlayer?.pause?.();
+        return;
       }
+      // The SD catalog naturally contains gaps. Resume from the nearest
+      // recording boundary instead of leaving the active player paused.
+      const playTime = Math.max(range.start, Math.min(range.end - 1, epoch));
+      await this.openTimelineRange(range, playTime);
     };
     const onPointerDown = (event) => {
       if (event.button !== undefined && event.button !== 0) return;
       // The user's hand owns the camera while scrubbing. Relinquish the old
       // stream so its time updates cannot pull the ruler away mid-drag.
-      this.disposePlayer?.pause?.();
-      this.selectedClip = null;
+      event.preventDefault();
+      // Freeze timeline updates while the user scrubs, but leave the
+      // continuous stream alive so releasing onto a recording can seek and
+      // continue immediately instead of stopping at a paused player.
+      playbackUpdatesSuspended = true;
       followPlayback = false;
       dragging = true;
       dragMoved = false;
       pointerId = event.pointerId;
+      // Keep receiving the drag when a desktop pointer leaves the visible
+      // timeline. Window listeners remain as a fallback for browser quirks.
+      try { container.setPointerCapture?.(pointerId); } catch (_error) {}
       dragStartX = event.clientX;
       dragStartScroll = container.scrollLeft;
+      this.timelineAnchor = {
+        camera: this.selectedCamera,
+        date: this.selectedDate,
+        time: epochAtPlayhead(),
+      };
       container.dataset.dragging = "true";
-      try {
-        container.setPointerCapture?.(event.pointerId);
-      } catch (_error) {
-        // Synthetic tests and older WebViews can expose the API without an active pointer.
-      }
     };
     const onPointerMove = (event) => {
       if (!dragging || event.pointerId !== pointerId) return;
@@ -1152,76 +1215,88 @@ class TuyaRecordingsPanel extends HTMLElement {
       if (!dragMoved) return;
       event.preventDefault();
       container.scrollLeft = Math.max(0, Math.min(scrollWidth(), dragStartScroll + delta));
+      this.timelineAnchor = {
+        camera: this.selectedCamera,
+        date: this.selectedDate,
+        time: epochAtPlayhead(),
+      };
     };
     const removeGlobalPointerListeners = () => {
       window.removeEventListener("pointermove", onPointerMove, true);
       window.removeEventListener("pointerup", finishPointer, true);
-      window.removeEventListener("pointercancel", finishPointer, true);
+      window.removeEventListener("pointercancel", cancelPointer, true);
     };
     const finishPointer = async (event) => {
       if (!dragging || event.pointerId !== pointerId) return;
       const moved = dragMoved;
       dragging = false;
+      const releasedPointerId = pointerId;
       pointerId = null;
+      try {
+        if (container.hasPointerCapture?.(releasedPointerId)) {
+          container.releasePointerCapture(releasedPointerId);
+        }
+      } catch (_error) {}
       removeGlobalPointerListeners();
       delete container.dataset.dragging;
-      try {
-        if (container.hasPointerCapture?.(event.pointerId)) container.releasePointerCapture(event.pointerId);
-      } catch (_error) {
-        // The browser may release capture before delivering pointercancel.
-      }
-      if (!moved) return;
-      suppressClick = true;
-      const epoch = epochAtPlayhead();
+      event.preventDefault();
+      const epoch = moved ? epochAtPlayhead() : epochAtPointer(event.clientX);
       applyTime(epoch);
+      this.timelineAnchor = { camera: this.selectedCamera, date: this.selectedDate, time: epoch };
       await playAt(epoch);
-      queueMicrotask(() => { suppressClick = false; });
+      if (this.pendingTimelineRender) this.render();
+    };
+    const cancelPointer = (event) => {
+      if (!dragging || event.pointerId !== pointerId) return;
+      // Losing capture is not a mouse release. Preserve the scrubbed position
+      // and do not turn it into an unintended seek.
+      dragging = false;
+      const releasedPointerId = pointerId;
+      pointerId = null;
+      try {
+        if (container.hasPointerCapture?.(releasedPointerId)) {
+          container.releasePointerCapture(releasedPointerId);
+        }
+      } catch (_error) {}
+      removeGlobalPointerListeners();
+      delete container.dataset.dragging;
+      this.timelineAnchor = {
+        camera: this.selectedCamera,
+        date: this.selectedDate,
+        time: epochAtPlayhead(),
+      };
+      if (this.pendingTimelineRender) this.render();
     };
     const addGlobalPointerListeners = () => {
       removeGlobalPointerListeners();
       window.addEventListener("pointermove", onPointerMove, { capture: true, passive: false });
       window.addEventListener("pointerup", finishPointer, true);
-      window.addEventListener("pointercancel", finishPointer, true);
-    };
-    const onSegmentClick = async (event) => {
-      if (suppressClick) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      const button = event.target.closest(".recording-segment");
-      if (!button) {
-        this.disposePlayer?.pause?.();
-        this.selectedClip = null;
-        followPlayback = false;
-        const epoch = epochAtPointer(event.clientX);
-        applyTime(epoch);
-        await playAt(epoch);
-        return;
-      }
-      event.stopPropagation();
-      followPlayback = false;
-      const range = ranges.find((item) => item.start === Number(button.dataset.start) && item.end === Number(button.dataset.end));
-      if (!range) return;
-      const bounds = button.getBoundingClientRect();
-      const fraction = Math.max(0, Math.min(1, (event.clientX - bounds.left) / Math.max(1, bounds.width)));
-      const epoch = range.start + ((range.end - range.start) * fraction);
-      applyTime(epoch);
-      await this.openTimelineRange(range, epoch);
+      window.addEventListener("pointercancel", cancelPointer, true);
     };
     container.addEventListener("scroll", onScroll, { passive: true });
     container.addEventListener("keydown", onKeyDown);
     container.addEventListener("pointerdown", onPointerDown);
-    container.addEventListener("pointermove", onPointerMove);
-    container.addEventListener("pointerup", finishPointer);
-    container.addEventListener("pointercancel", finishPointer);
-    container.addEventListener("lostpointercapture", finishPointer);
-    container.addEventListener("click", onSegmentClick);
+    // The window listener owns the drag after the initial press, including
+    // when the pointer leaves the visible ruler.
     container.addEventListener("pointerdown", addGlobalPointerListeners);
     this.timeline = {
       setTime,
+      getTime: epochAtPlayhead,
+      isDragging: () => dragging,
+      expectPlaybackAt: (epoch) => {
+        expectedPlaybackTime = epoch;
+        playbackUpdatesSuspended = true;
+      },
       followPlayback: (epoch) => {
         if (dragging || !this.selectedClip) return;
+        if (expectedPlaybackTime !== null) {
+          // Ignore residual position events from the old stream until the
+          // replacement stream reaches the point the user dropped.
+          if (Math.abs(epoch - expectedPlaybackTime) > 15) return;
+          expectedPlaybackTime = null;
+          playbackUpdatesSuspended = false;
+        }
+        if (playbackUpdatesSuspended) return;
         followPlayback = true;
         applyTime(epoch);
       },
@@ -1230,11 +1305,6 @@ class TuyaRecordingsPanel extends HTMLElement {
         container.removeEventListener("scroll", onScroll);
         container.removeEventListener("keydown", onKeyDown);
         container.removeEventListener("pointerdown", onPointerDown);
-        container.removeEventListener("pointermove", onPointerMove);
-        container.removeEventListener("pointerup", finishPointer);
-        container.removeEventListener("pointercancel", finishPointer);
-        container.removeEventListener("lostpointercapture", finishPointer);
-        container.removeEventListener("click", onSegmentClick);
         container.removeEventListener("pointerdown", addGlobalPointerListeners);
         removeGlobalPointerListeners();
       },
@@ -1376,34 +1446,6 @@ class TuyaRecordingsPanel extends HTMLElement {
     }
     const digits = value >= 10 ? 1 : 2;
     return `${value.toFixed(digits)} ${unit}`;
-  }
-
-  readyDetail(pending) {
-    if (pending > 0) return `${this.formatNumber(pending)} still syncing`;
-    return "All caught up";
-  }
-
-  latestRecordingValue(latest) {
-    if (!latest?.start) return "None yet";
-    return this.formatTime(latest.start);
-  }
-
-  latestRecordingDetail(latest) {
-    if (!latest?.start) return "No recordings available";
-    const duration = this.formatDuration(latest.duration);
-    return `${latest.camera_name || "Camera"} • ${duration}`;
-  }
-
-  cameraCountValue(online, total) {
-    if (!total) return "0";
-    return `${this.formatNumber(online)}/${this.formatNumber(total)}`;
-  }
-
-  cameraCountDetail(online, total) {
-    if (!total) return "No cameras found";
-    if (online === total) return "All cameras online";
-    if (!online) return "All cameras offline";
-    return `${this.formatNumber(total - online)} offline`;
   }
 
   friendlySyncState(sync, pending) {

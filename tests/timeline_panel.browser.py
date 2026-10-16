@@ -95,6 +95,13 @@ def main() -> None:
                   const targetScroll = (targetSeconds / 86400) * scrollWidth;
                   const startX = bounds.left + bounds.width / 2;
                   const releaseX = startX - (targetScroll - ruler.scrollLeft);
+                  const activeRange = panel.recordingRanges[0];
+                  const calls = [];
+                  const controller = () => {};
+                  controller.pause = () => calls.push('pause');
+                  controller.playClip = (clip, offset) => calls.push({start: clip.start, offset});
+                  panel.disposePlayer = controller;
+                  panel.selectedClip = {...activeRange, play_time: activeRange.start};
                   ruler.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, pointerId: 7, pointerType: 'mouse', button: 0, clientX: startX}));
                   window.dispatchEvent(new PointerEvent('pointermove', {bubbles: true, pointerId: 7, pointerType: 'mouse', button: 0, clientX: releaseX}));
                   window.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, pointerId: 7, pointerType: 'mouse', button: 0, clientX: releaseX}));
@@ -107,15 +114,46 @@ def main() -> None:
                     afterStalePlayerUpdate: Number(ruler.getAttribute('aria-valuenow')),
                     dragging: ruler.dataset.dragging || '',
                     releasedOutside: releaseX > bounds.right,
+                    selectionAfterDrag: window.timelineSelection || null,
+                    calls,
                   };
                 }"""
             )
-            page.evaluate(
-                """() => {
-                  const root = document.querySelector('tuya-recordings-panel').shadowRoot;
-                  const segment = root.querySelector('.recording-segment');
-                  const bounds = segment.getBoundingClientRect();
-                  segment.dispatchEvent(new MouseEvent('click', {bubbles: true, clientX: bounds.left + bounds.width / 2}));
+            resume_report = page.evaluate(
+                """async () => {
+                  const panel = document.querySelector('tuya-recordings-panel');
+                  const root = panel.shadowRoot;
+                  const ruler = root.querySelector('#recording-timeline');
+                  const bounds = ruler.getBoundingClientRect();
+                  const dayStart = new Date(panel.selectedDate + 'T00:00:00').getTime() / 1000;
+                  const range = panel.recordingRanges[0];
+                  const target = range.start + 5;
+                  const targetScroll = ((target - dayStart) / 86400) * (ruler.scrollWidth - ruler.clientWidth);
+                  const startX = bounds.left + bounds.width / 2;
+                  const releaseX = startX - (targetScroll - ruler.scrollLeft);
+                  const calls = [];
+                  const controller = () => {};
+                  controller.pause = () => calls.push('pause');
+                  controller.playClip = (clip, offset) => calls.push({start: clip.start, offset});
+                  panel.disposePlayer = controller;
+                  panel.selectedClip = {...range, play_time: range.start};
+                  delete panel.openTimelineRange;
+                  ruler.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, pointerId: 8, pointerType: 'mouse', button: 0, clientX: startX}));
+                  window.dispatchEvent(new PointerEvent('pointermove', {bubbles: true, pointerId: 8, pointerType: 'mouse', button: 0, clientX: releaseX}));
+                  window.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, pointerId: 8, pointerType: 'mouse', button: 0, clientX: releaseX}));
+                  await new Promise(resolve => setTimeout(resolve, 50));
+                  const droppedValue = Number(ruler.getAttribute('aria-valuenow'));
+                  panel.updateTimelinePlayhead(dayStart + 2 * 3600);
+                  const afterOldStreamUpdate = Number(ruler.getAttribute('aria-valuenow'));
+                  panel.updateTimelinePlayhead(target);
+                  const afterReplacementStreamUpdate = Number(ruler.getAttribute('aria-valuenow'));
+                  return {
+                    calls,
+                    droppedValue,
+                    expectedValue: target - dayStart,
+                    afterOldStreamUpdate,
+                    afterReplacementStreamUpdate,
+                  };
                 }"""
             )
             persistent_player = page.evaluate(
@@ -194,8 +232,11 @@ def main() -> None:
                   const panel = document.querySelector('tuya-recordings-panel');
                   const now = Date.now() / 1000;
                   panel.selectedDate = panel.localDateString(new Date());
+                  panel.selectedClip = null;
+                  panel.timelineAnchor = null;
                   const dayStart = new Date(`${panel.selectedDate}T00:00:00`).getTime() / 1000;
-                  const stale = {start: dayStart + 8 * 3600, end: dayStart + 8 * 3600 + 60};
+                  const staleStart = Math.max(dayStart, now - 3600);
+                  const stale = {start: staleStart, end: staleStart + 60};
                   const recent = {start: now - 120, end: now - 60};
                   return {
                     stale: panel.timelineInitialTime([stale], dayStart),
@@ -205,6 +246,111 @@ def main() -> None:
                   };
                 }"""
             )
+            keyboard_report = page.evaluate(
+                """async () => {
+                  const panel = document.querySelector('tuya-recordings-panel');
+                  panel.selectedDate = '2026-09-21';
+                  panel.selectedClip = {...panel.recordingRanges[0], play_time: panel.recordingRanges[0].start};
+                  panel.timelineAnchor = null;
+                  panel.render();
+                  await new Promise(resolve => requestAnimationFrame(resolve));
+                  const ruler = panel.shadowRoot.querySelector('#recording-timeline');
+                  const dayStart = new Date(panel.selectedDate + 'T00:00:00').getTime() / 1000;
+                  ruler.dispatchEvent(new KeyboardEvent('keydown', {bubbles: true, key: 'PageDown'}));
+                  const afterKey = Number(ruler.getAttribute('aria-valuenow'));
+                  panel.updateTimelinePlayhead(dayStart + 18 * 3600);
+                  return {
+                    afterKey,
+                    afterStaleUpdate: Number(ruler.getAttribute('aria-valuenow')),
+                    anchorOffset: panel.timelineAnchor?.time - dayStart,
+                  };
+                }"""
+            )
+            cancellation_report = page.evaluate(
+                """async () => {
+                  const panel = document.querySelector('tuya-recordings-panel');
+                  panel.selectedDate = '2026-09-21';
+                  panel.render();
+                  await new Promise(resolve => requestAnimationFrame(resolve));
+                  const ruler = panel.shadowRoot.querySelector('#recording-timeline');
+                  const bounds = ruler.getBoundingClientRect();
+                  const dayStart = new Date(panel.selectedDate + 'T00:00:00').getTime() / 1000;
+                  const targetSeconds = 19 * 3600;
+                  const scrollWidth = ruler.scrollWidth - ruler.clientWidth;
+                  const targetScroll = (targetSeconds / 86400) * scrollWidth;
+                  const startX = bounds.left + bounds.width / 2;
+                  const targetX = startX - (targetScroll - ruler.scrollLeft);
+                  const calls = [];
+                  const controller = () => {};
+                  controller.playClip = (...args) => calls.push(args);
+                  panel.disposePlayer = controller;
+                  ruler.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, pointerId: 9, pointerType: 'mouse', button: 0, clientX: startX}));
+                  window.dispatchEvent(new PointerEvent('pointermove', {bubbles: true, pointerId: 9, pointerType: 'mouse', button: 0, clientX: targetX}));
+                  await new Promise(resolve => requestAnimationFrame(resolve));
+                  const beforeCancellation = (ruler.scrollLeft / (ruler.scrollWidth - ruler.clientWidth)) * 86400;
+                  window.dispatchEvent(new PointerEvent('pointercancel', {bubbles: true, pointerId: 9, pointerType: 'mouse', clientX: targetX}));
+                  panel.render();
+                  await new Promise(resolve => requestAnimationFrame(resolve));
+                  const rebuilt = panel.shadowRoot.querySelector('#recording-timeline');
+                  return {
+                    beforeCancellation,
+                    afterCancellationAndRender: Number(rebuilt.getAttribute('aria-valuenow')),
+                    calls,
+                    dragging: rebuilt.dataset.dragging || '',
+                  };
+                }"""
+            )
+            page.evaluate(
+                """async () => {
+                  const panel = document.querySelector('tuya-recordings-panel');
+                  panel.selectedDate = '2026-09-21';
+                  panel.render();
+                  await new Promise(resolve => requestAnimationFrame(resolve));
+                }"""
+            )
+            drag_box = page.evaluate(
+                """() => {
+                  const box = document.querySelector('tuya-recordings-panel').shadowRoot
+                    .querySelector('#recording-timeline').getBoundingClientRect();
+                  return {x: box.left + box.width / 2, y: box.top + box.height / 2};
+                }"""
+            )
+            page.mouse.move(drag_box["x"], drag_box["y"])
+            page.mouse.down()
+            page.mouse.move(drag_box["x"] - 150, drag_box["y"], steps=8)
+            redraw_while_dragging = page.evaluate(
+                """() => {
+                  const panel = document.querySelector('tuya-recordings-panel');
+                  const before = panel.shadowRoot.querySelector('#recording-timeline');
+                  panel.render();
+                  return {
+                    sameRuler: before === panel.shadowRoot.querySelector('#recording-timeline'),
+                    pending: panel.pendingTimelineRender,
+                  };
+                }"""
+            )
+            native_drag_mid = page.evaluate(
+                """() => {
+                  const ruler = document.querySelector('tuya-recordings-panel').shadowRoot
+                    .querySelector('#recording-timeline');
+                  return {scrollLeft: ruler.scrollLeft, time: Number(ruler.getAttribute('aria-valuenow'))};
+                }"""
+            )
+            page.mouse.move(drag_box["x"] - 350, drag_box["y"], steps=10)
+            native_drag_far = page.evaluate(
+                """() => document.querySelector('tuya-recordings-panel').shadowRoot
+                  .querySelector('#recording-timeline').scrollLeft"""
+            )
+            page.mouse.move(drag_box["x"] - 520, drag_box["y"], steps=8)
+            native_drag_outside = page.evaluate(
+                """() => {
+                  const ruler = document.querySelector('tuya-recordings-panel').shadowRoot
+                    .querySelector('#recording-timeline');
+                  return {scrollLeft: ruler.scrollLeft, dragging: ruler.dataset.dragging || ''};
+                }"""
+            )
+            page.mouse.up()
+            page.wait_for_timeout(50)
             page.set_viewport_size({"width": 1280, "height": 720})
             desktop_player_width = page.evaluate(
                 "document.querySelector('tuya-recordings-panel').shadowRoot.querySelector('.timeline-player').getBoundingClientRect().width"
@@ -272,13 +418,33 @@ def main() -> None:
             "selected": "2026-09-21",
             "dialog": True,
         }
-        assert report["selection"]["start"] == 1790011833
         assert drag_report["dragging"] == ""
         assert drag_report["releasedOutside"] is True
+        assert drag_report["selectionAfterDrag"] == {"start": 1790011833, "time": 1790011833}
         assert abs(drag_report["droppedValue"] - 4 * 3600) <= 30, drag_report
+        assert abs(drag_report["afterStalePlayerUpdate"] - drag_report["droppedValue"]) <= 1, drag_report
         assert drag_report["afterStalePlayerUpdate"] == drag_report["droppedValue"]
+        assert len(resume_report["calls"]) == 1, resume_report
+        assert resume_report["calls"][0]["start"] == 1790011833, resume_report
+        assert abs(resume_report["calls"][0]["offset"] - 5) <= 1, resume_report
+        assert abs(resume_report["droppedValue"] - resume_report["expectedValue"]) <= 30, resume_report
+        assert abs(resume_report["afterOldStreamUpdate"] - resume_report["droppedValue"]) <= 1, resume_report
+        assert abs(resume_report["afterReplacementStreamUpdate"] - resume_report["expectedValue"]) <= 1, resume_report
+        assert redraw_while_dragging == {"sameRuler": True, "pending": True}, redraw_while_dragging
+        assert native_drag_mid["scrollLeft"] > 100, native_drag_mid
+        assert native_drag_mid["time"] > 0, native_drag_mid
+        assert native_drag_far > native_drag_mid["scrollLeft"] + 100, (native_drag_mid, native_drag_far)
+        assert native_drag_outside["scrollLeft"] > native_drag_far + 100, native_drag_outside
+        assert native_drag_outside["dragging"] == "true", native_drag_outside
+        assert 0 < keyboard_report["afterKey"] <= 86400, keyboard_report
+        assert keyboard_report["afterStaleUpdate"] == keyboard_report["afterKey"], keyboard_report
+        assert abs(keyboard_report["anchorOffset"] - keyboard_report["afterKey"]) <= 1, keyboard_report
+        assert cancellation_report["calls"] == [], cancellation_report
+        assert cancellation_report["dragging"] == "", cancellation_report
+        assert abs(cancellation_report["beforeCancellation"] - 19 * 3600) <= 30, cancellation_report
+        assert abs(cancellation_report["afterCancellationAndRender"] - cancellation_report["beforeCancellation"]) <= 1, cancellation_report
         assert "Recorded video" in report["text"]
-        assert "Drag to choose a time" in report["text"]
+        assert "Drag to browse, tap a recording to play" in report["text"]
         assert stale_report["calls"] == [
             "tuya_recordings/panel?",
             "tuya_recordings/panel?camera=fixture&date=2026-09-21",

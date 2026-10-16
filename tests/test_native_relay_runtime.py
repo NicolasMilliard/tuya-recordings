@@ -377,6 +377,58 @@ def test_worker_switches_clips_on_one_connected_transport():
     assert playback.closed is True
 
 
+def test_stream_worker_close_interrupts_active_camera_frame_wait():
+    """Retiring a one-shot worker must not leave a camera stream behind."""
+
+    class BlockingStreamPlayback(Playback):
+        def __init__(self):
+            super().__init__()
+            self.playback_started = threading.Event()
+
+        async def start(self, **kwargs):
+            self.started = kwargs
+            self.start_calls.append(kwargs)
+            self._playback_started = True
+            self.playback_started.set()
+
+    playback = BlockingStreamPlayback()
+    worker = NativeRelayStreamWorker(
+        camera_config(),
+        APP_SESSION,
+        playback_factory=lambda *args, **kwargs: playback,
+        end_idle_timeout=0.01,
+    )
+    failures = []
+
+    def play() -> None:
+        try:
+            worker.stream(
+                NativePlaybackRequest(
+                    start=100,
+                    end=110,
+                    media_format=NativeMediaFormat.RAW_PACKETS,
+                ),
+                lambda event: None,
+                None,
+            )
+        except Exception as err:  # noqa: BLE001 - cross-thread assertion
+            failures.append(err)
+
+    active = threading.Thread(target=play)
+    active.start()
+    assert playback.playback_started.wait(1)
+    worker.close()
+    active.join(2)
+
+    assert not active.is_alive()
+    assert worker.wait_closed(2)
+    assert len(failures) == 1
+    assert isinstance(failures[0], NativeRelayRuntimeError)
+    assert "cancelled" in str(failures[0])
+    assert playback.stop_count == 1
+    assert playback.closed is True
+
+
 def test_worker_treats_completed_thumbnail_as_graceful_playback_stop():
     class ThumbnailPlayback(ReusablePlayback):
         async def start(self, **kwargs):
@@ -1200,6 +1252,42 @@ def test_interactive_timeline_seeks_pauses_and_resumes_one_camera_object():
         for event in events
         if event["payload"]["type"] == "started"
     ] == [1, 2]
+    assert [
+        event["payload"]["info"].get("position")
+        for event in events
+        if event["payload"]["type"] == "started"
+    ] == [100, 205]
+
+
+def test_interactive_timeline_cancellation_interrupts_a_blocked_frame_wait():
+    """Closing the browser must release an interactive camera session promptly."""
+
+    async def run() -> Playback:
+        cancel = threading.Event()
+        playback = Playback()
+        session = NativeRelayRuntimeSession(
+            replace(camera_config(), skill=json.dumps({"localStorage": 33554432 | 128})),
+            app_session=APP_SESSION,
+            cancel_event=cancel,
+            end_idle_timeout=0.01,
+        )
+        request = NativePlaybackRequest(
+            start=100,
+            end=110,
+            fragments_json='{"fragments":[{"start":100,"end":110}]}',
+            media_format=NativeMediaFormat.RAW_PACKETS,
+        )
+        task = asyncio.create_task(
+            session._interactive_connected(playback, request, lambda event: None, queue.Queue())
+        )
+        await asyncio.sleep(0.05)
+        cancel.set()
+        await asyncio.wait_for(task, timeout=1)
+        return playback
+
+    playback = asyncio.run(run())
+
+    assert playback.stop_count == 1
 
 
 def test_interactive_timeline_collapses_rapid_seeks_to_the_latest_position():
@@ -1273,6 +1361,55 @@ def test_playback_is_not_announced_when_camera_rejects_start():
         )
 
     assert events == []
+
+
+def test_worker_close_interrupts_active_interactive_frame_wait():
+    """Worker shutdown must cancel a viewer that is waiting on camera media."""
+
+    class BlockingInteractivePlayback(Playback):
+        def __init__(self):
+            super().__init__()
+            self.playback_started = threading.Event()
+
+        async def start(self, **kwargs):
+            self.started = kwargs
+            self.start_calls.append(kwargs)
+            self._playback_started = True
+            self.playback_started.set()
+
+    playback = BlockingInteractivePlayback()
+    worker = NativeRelayPlaybackWorker(
+        camera_config(),
+        APP_SESSION,
+        playback_factory=lambda *args, **kwargs: playback,
+        end_idle_timeout=0.01,
+    )
+    request = NativePlaybackRequest(
+        start=100,
+        end=110,
+        fragments_json='{"fragments":[{"start":100,"end":110}]}',
+        media_format=NativeMediaFormat.RAW_PACKETS,
+    )
+    failures = []
+
+    def play() -> None:
+        try:
+            worker.interactive_stream(request, lambda event: None, queue.Queue(), None)
+        except Exception as err:  # noqa: BLE001 - cross-thread assertion
+            failures.append(err)
+
+    active = threading.Thread(target=play)
+    active.start()
+    assert playback.playback_started.wait(1)
+    worker.close()
+    active.join(2)
+
+    assert not active.is_alive()
+    assert worker.wait_closed(2)
+    # Interactive cancellation is a normal viewer shutdown, not a playback error.
+    assert failures == []
+    assert playback.stop_count == 1
+    assert playback.closed is True
 
 
 def test_interactive_worker_closes_transport_when_viewer_leaves():

@@ -596,13 +596,14 @@ class NativeRelayPlaybackSession:
         self._send_control_plain(audio_stop)
 
     def _reset_media_state(self) -> None:
-        """Discard completed frames while preserving continuous RTP state."""
+        """Discard every decoder-bound state before a new playback stream."""
         self._media_frames = asyncio.Queue(maxsize=_MEDIA_QUEUE_LIMIT)
         self._parser = NativePlaybackStreamParser()
         self._rtp_packets.clear()
         self._rtp_codec_info.clear()
         self._media_stream_packets.clear()
         self._raw_media_samples.clear()
+        self._h264 = NativeH264RtpDepacketizer()
         self._video_frame_number = 0
         self._audio_frame_number = 0
 

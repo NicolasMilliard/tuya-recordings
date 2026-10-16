@@ -46,7 +46,7 @@ and fast repeat playback. It is off by default.
   work, and optional caching.
 - Smart Life or Tuya Smart QR authorization during setup. No Tuya Developer project or
   LocalTuya camera entry is required.
-- No helper process or bundled executable.
+- No separate bridge, sidecar, or bundled executable.
 
 ## Requirements
 
@@ -167,10 +167,10 @@ Camera work is serialized across Tuya Recordings and interactive playback takes
 priority over background work. The integration does not fan out parallel
 recording sessions across cameras.
 
-When local caching is enabled, **Pause camera activity** stops camera-facing
-refresh, caching, thumbnail work, and uncached playback while continuing to
-serve complete files already saved locally. Turn it on while a camera is
-recovering or when you want Tuya Recordings completely quiet.
+**Pause camera activity** stops every camera-facing action in either mode:
+catalog refresh, live SD playback, caching, and thumbnail work. Complete files
+already saved locally remain available. Turn it on while a camera is recovering
+or when you want Tuya Recordings completely quiet.
 
 ## Troubleshooting
 

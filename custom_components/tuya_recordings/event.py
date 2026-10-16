@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from threading import current_thread, main_thread
 from typing import Any
 
 from homeassistant.components.event import EventEntity
@@ -78,7 +79,7 @@ class TuyaRecordingAlertEvent(EventEntity):
             manufacturer=MANUFACTURER,
             model=NAME,
         )
-        self._last_notification_values: dict[str, str | bytes] = {}
+        self._last_notification_values: dict[str, tuple[str | bytes, int | None]] = {}
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -109,8 +110,16 @@ class TuyaRecordingAlertEvent(EventEntity):
         if not isinstance(new_state, State):
             return
         raw_code = notification_event_code(new_state.state, new_state.attributes)
-        if raw_code is not None:
-            self._record_event(raw_code, dict(new_state.attributes))
+        if raw_code is None:
+            return
+        old_state = event.data.get("old_state")
+        if (
+            isinstance(old_state, State)
+            and notification_event_code(old_state.state, old_state.attributes) == raw_code
+            and dict(old_state.attributes) == dict(new_state.attributes)
+        ):
+            return
+        self._record_event(raw_code, dict(new_state.attributes))
 
     @callback
     def _handle_tuya_device_update(
@@ -129,9 +138,18 @@ class TuyaRecordingAlertEvent(EventEntity):
             raw_value = device.status.get(status_code)
             if not isinstance(raw_value, (str, bytes)) or raw_value in ("", b""):
                 continue
-            if raw_value == self._last_notification_values.get(status_code):
+            # Tuya may emit the same alert payload for distinct detections.
+            # The DP timestamp identifies a new camera notification while the
+            # payload alone protects against duplicate dispatcher callbacks.
+            timestamp = (
+                dp_timestamps.get(status_code)
+                if dp_timestamps and status_code in dp_timestamps
+                else None
+            )
+            notification_value = (raw_value, timestamp)
+            if notification_value == self._last_notification_values.get(status_code):
                 continue
-            self._last_notification_values[status_code] = raw_value
+            self._last_notification_values[status_code] = notification_value
             payload = decode_notification_message(raw_value)
             if payload is None:
                 continue
@@ -140,14 +158,19 @@ class TuyaRecordingAlertEvent(EventEntity):
                 continue
             attributes = notification_metadata(payload)
             attributes["notification_dp"] = status_code
-            if dp_timestamps and status_code in dp_timestamps:
-                attributes["dp_timestamp"] = dp_timestamps[status_code]
+            if timestamp is not None:
+                attributes["dp_timestamp"] = timestamp
             self._record_event(raw_code, attributes)
             return
 
     @callback
     def _record_event(self, raw_code: str, attributes: dict[str, Any]) -> None:
         """Write only the camera's explicit notification, never a guessed state."""
+        if current_thread() is not main_thread():
+            self.hass.loop.call_soon_threadsafe(
+                self._record_event, raw_code, dict(attributes)
+            )
+            return
         event_type = "cleared" if notification_is_cleared(attributes) else "detected"
         self._trigger_event(event_type, {**attributes, "tuya_event_code": raw_code})
         self.async_write_ha_state()

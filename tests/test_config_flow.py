@@ -18,9 +18,15 @@ from custom_components.tuya_recordings.config_flow import (
     _validate_form_input,
 )
 from custom_components.tuya_recordings.const import (
+    CONF_ALERT_RESET_SECONDS,
     CONF_APP_PROFILE,
     CONF_CATALOG_SYNC_MINUTES,
+    CONF_LOOKBACK_DAYS,
     CONF_MEDIA_STORAGE_PATH,
+    CONF_MEDIA_SYNC_HOURS,
+    CONF_MEDIA_VIEW_RECORDINGS_ORDER,
+    CONF_MEDIA_SYNC_ENABLED,
+    CONF_REGION,
     DEFAULT_CATALOG_SYNC_MINUTES,
 )
 
@@ -91,6 +97,39 @@ def test_media_storage_path_validation_normalizes_valid_path(path):
 
     assert _validate_form_input(user_input) == {}
     assert user_input[CONF_MEDIA_STORAGE_PATH] == "/media/tuya_recordings"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (CONF_LOOKBACK_DAYS, -1),
+        (CONF_LOOKBACK_DAYS, 32),
+        (CONF_CATALOG_SYNC_MINUTES, 14),
+        (CONF_CATALOG_SYNC_MINUTES, 1441),
+        (CONF_MEDIA_SYNC_HOURS, 745),
+        (CONF_ALERT_RESET_SECONDS, 4),
+        (CONF_ALERT_RESET_SECONDS, True),
+        (CONF_MEDIA_VIEW_RECORDINGS_ORDER, "Random"),
+        (CONF_REGION, "not-a-tuya-region"),
+        (CONF_MEDIA_SYNC_ENABLED, "yes"),
+    ],
+)
+def test_form_validation_rejects_out_of_range_or_unknown_option_values(field, value):
+    user_input = {CONF_MEDIA_STORAGE_PATH: "/media/tuya_recordings", field: value}
+
+    assert _validate_form_input(user_input) == {field: "invalid_value"}
+
+
+def test_form_validation_normalizes_numeric_option_values():
+    user_input = {
+        CONF_MEDIA_STORAGE_PATH: "/media/tuya_recordings",
+        CONF_CATALOG_SYNC_MINUTES: "30",
+        CONF_ALERT_RESET_SECONDS: "75",
+    }
+
+    assert _validate_form_input(user_input) == {}
+    assert user_input[CONF_CATALOG_SYNC_MINUTES] == 30
+    assert user_input[CONF_ALERT_RESET_SECONDS] == 75
 
 
 def test_setup_requires_official_tuya_but_not_localtuya():

@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,12 +12,10 @@ from custom_components.tuya_recordings.client import TuyaRecordingsClient
 def test_unload_cancels_only_the_successfully_unloaded_entry(unload_ok, monkeypatch):
     client = TuyaRecordingsClient({})
     other = TuyaRecordingsClient({})
-    timer = Mock()
     data = {
         "client": client,
         integration.DATA_MEDIA_SYNC_PENDING: True,
         integration.DATA_THUMBNAIL_SYNC_PENDING: True,
-        integration.DATA_RECORDING_TRIGGER_TIMER: timer,
     }
     entries = {"entry": data, "other": {"client": other}}
 
@@ -36,4 +34,3 @@ def test_unload_cancels_only_the_successfully_unloaded_entry(unload_ok, monkeypa
     assert ("entry" not in entries) is unload_ok
     assert data[integration.DATA_MEDIA_SYNC_PENDING] is not unload_ok
     assert data[integration.DATA_THUMBNAIL_SYNC_PENDING] is not unload_ok
-    assert timer.call_count == int(unload_ok)

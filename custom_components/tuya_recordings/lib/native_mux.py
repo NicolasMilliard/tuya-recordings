@@ -24,15 +24,28 @@ class NativeMuxError(RuntimeError):
     """Native playback events could not be converted into a media file."""
 
 
-BROWSER_STREAM_MAGIC = b"TRS2"
+# A segment header is emitted before each independently seekable browser
+# sequence. The generation and requested camera time let the browser reject
+# residual frames from a superseded seek before they reach MediaSource/audio.
+BROWSER_STREAM_MAGIC = b"TRS3"
 BROWSER_STREAM_VIDEO = 1
 BROWSER_STREAM_AUDIO_PCM_S16LE = 2
 BROWSER_STREAM_END = 3
 BROWSER_STREAM_AUDIO_G711U = 4
 BROWSER_STREAM_AUDIO_FORMAT = 5
 _BROWSER_STREAM_HEADER = struct.Struct(">BQI")
+_BROWSER_STREAM_SEGMENT = struct.Struct(">IQ")
 _BROWSER_STREAM_AUDIO_FORMAT = struct.Struct(">IB")
 _PIPE_READ_BYTES = 64 * 1024
+
+
+def browser_stream_header(generation: int = 0, position: int = 0) -> bytes:
+    """Return the versioned header for one browser media sequence."""
+    if type(generation) is not int or generation < 0:
+        raise NativeMuxError("Native browser stream generation is invalid")
+    if type(position) is not int or position < 0:
+        raise NativeMuxError("Native browser stream position is invalid")
+    return BROWSER_STREAM_MAGIC + _BROWSER_STREAM_SEGMENT.pack(generation, position)
 
 
 def _read_pipe_chunk(stream: Any) -> bytes:
@@ -526,6 +539,7 @@ class NativePlaybackBrowserStreamMuxer:
     process_module: Any = subprocess
     pipe_factory: Any = os.pipe
     protocol: int = NATIVE_PLAYBACK_EVENT_VERSION
+    stream_header: bytes = BROWSER_STREAM_MAGIC + _BROWSER_STREAM_SEGMENT.pack(0, 0)
     _video_handle: Any = field(default=None, init=False, repr=False)
     _proc: Any = field(default=None, init=False, repr=False)
     _reader: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -536,6 +550,7 @@ class NativePlaybackBrowserStreamMuxer:
     _first_video_timestamp: int = field(default=0, init=False, repr=False)
     _audio_format: tuple[int, int] | None = field(default=None, init=False, repr=False)
     _announced: bool = field(default=False, init=False, repr=False)
+    _h264_parameter_sets: bytes = field(default=b"", init=False, repr=False)
 
     def __enter__(self) -> Self:
         self.open()
@@ -615,6 +630,7 @@ class NativePlaybackBrowserStreamMuxer:
         self._first_video_timestamp = 0
         self._audio_format = None
         self._announced = False
+        self._h264_parameter_sets = b""
         self._reader = threading.Thread(
             target=self._read_stdout,
             name="tuya-recordings-browser-stream",
@@ -628,7 +644,7 @@ class NativePlaybackBrowserStreamMuxer:
         frame_type = NativePlaybackFrameType(payload["type"])
         if frame_type == NativePlaybackFrameType.STARTED:
             if not self._announced:
-                self.chunk_callback(BROWSER_STREAM_MAGIC)
+                self.chunk_callback(self.stream_header)
                 self._announced = True
             return
         if frame_type == NativePlaybackFrameType.FINISHED:
@@ -643,9 +659,21 @@ class NativePlaybackBrowserStreamMuxer:
         codec = _codec_name(info)
         if codec in {"h264", "avc"}:
             if not self._video_bytes:
-                if not _has_h264_sps(data):
+                parameter_sets = _h264_parameter_sets(data)
+                if parameter_sets:
+                    self._h264_parameter_sets = _merge_h264_parameter_sets(
+                        self._h264_parameter_sets,
+                        parameter_sets,
+                    )
+                # A new browser segment needs a complete decoder configuration
+                # and an IDR access unit. Starting FFmpeg on an SPS-only or
+                # inter-frame packet yields an apparently valid fMP4 stream
+                # that can play audio while Chromium never renders video.
+                if not _has_h264_decoder_config(self._h264_parameter_sets) or not _has_h264_idr(data):
                     return
                 self._first_video_timestamp = int(info.get("timestamp") or 0)
+                if not parameter_sets:
+                    data = self._h264_parameter_sets + data
             self._write_video(data)
             return
         if codec == "pcm_s16le":
@@ -807,7 +835,14 @@ class NativePlaybackInteractiveBrowserMuxer:
         )
         frame_type = NativePlaybackFrameType(event["payload"]["type"])
         if frame_type == NativePlaybackFrameType.STARTED:
-            self._replace_muxer()
+            info = event["payload"].get("info") or {}
+            generation = info.get("generation")
+            position = info.get("position")
+            if type(generation) is not int or generation < 1:
+                raise NativeMuxError("Interactive playback generation is invalid")
+            if type(position) is not int or position < 0:
+                raise NativeMuxError("Interactive playback position is invalid")
+            self._replace_muxer(generation, position)
             assert self._muxer is not None
             self._muxer.handle_event(event)
             return
@@ -827,15 +862,69 @@ class NativePlaybackInteractiveBrowserMuxer:
         if muxer is not None:
             muxer.cleanup()
 
-    def _replace_muxer(self) -> None:
+    def _replace_muxer(self, generation: int, position: int) -> None:
         self.cleanup()
         muxer = self.muxer_factory(self.chunk_callback)
+        if isinstance(muxer, NativePlaybackBrowserStreamMuxer):
+            muxer.stream_header = browser_stream_header(generation, position)
         muxer.open()
         self._muxer = muxer
 
 
-def _has_h264_sps(payload: bytes) -> bool:
-    return any(nal and nal[0] & 0x1F == 7 for nal in payload.split(b"\x00\x00\x01")[1:])
+def _h264_nals(payload: bytes) -> tuple[bytes, ...]:
+    """Return Annex-B NAL units without assuming a fixed start-code width."""
+    units: list[bytes] = []
+    offset = 0
+    while offset < len(payload):
+        three = payload.find(b"\x00\x00\x01", offset)
+        four = payload.find(b"\x00\x00\x00\x01", offset)
+        if three < 0 and four < 0:
+            break
+        if four >= 0 and (three < 0 or four <= three):
+            start = four + 4
+        else:
+            start = three + 3
+        next_three = payload.find(b"\x00\x00\x01", start)
+        next_four = payload.find(b"\x00\x00\x00\x01", start)
+        candidates = [item for item in (next_three, next_four) if item >= 0]
+        end = min(candidates) if candidates else len(payload)
+        if start < end:
+            units.append(payload[start:end])
+        offset = end
+    return tuple(units)
+
+
+def _h264_parameter_sets(payload: bytes) -> bytes:
+    """Keep the latest SPS/PPS pair so an IDR can start a fresh muxer."""
+    parameter_sets = [
+        b"\x00\x00\x00\x01" + nal
+        for nal in _h264_nals(payload)
+        if nal and nal[0] & 0x1F in {7, 8}
+    ]
+    return b"".join(parameter_sets)
+
+
+def _merge_h264_parameter_sets(current: bytes, update: bytes) -> bytes:
+    """Retain one current SPS and PPS when the camera sends them separately."""
+    selected: dict[int, bytes] = {}
+    for payload in (current, update):
+        for nal in _h264_nals(payload):
+            if nal and nal[0] & 0x1F in {7, 8}:
+                selected[nal[0] & 0x1F] = nal
+    return b"".join(
+        b"\x00\x00\x00\x01" + selected[nal_type]
+        for nal_type in (7, 8)
+        if nal_type in selected
+    )
+
+
+def _has_h264_decoder_config(payload: bytes) -> bool:
+    types = {nal[0] & 0x1F for nal in _h264_nals(payload) if nal}
+    return {7, 8}.issubset(types)
+
+
+def _has_h264_idr(payload: bytes) -> bool:
+    return any(nal and nal[0] & 0x1F == 5 for nal in _h264_nals(payload))
 
 
 def _decode_process_output(payload: Any) -> str:

@@ -446,3 +446,94 @@ def test_timeline_range_resolution_uses_containing_then_next_range():
     assert _timeline_range_for_time(index, "camera-1", 150) == (200, 240)
     assert _timeline_range_for_time(index, "camera-1", 250) == (200, 240)
     assert _timeline_range_for_time(index, "missing", 110) is None
+
+def test_person_detection_markers_use_camera_event_time(monkeypatch):
+    """Timeline markers follow the camera event, not HA's delayed receipt."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from custom_components.tuya_recordings import http as recordings_http
+
+    day_start = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    day_end = datetime(2026, 10, 10, tzinfo=timezone.utc)
+    states = [
+        SimpleNamespace(
+            state="on",
+            last_changed=datetime(2026, 10, 9, 14, 20, tzinfo=timezone.utc),
+            attributes={"last_event_attributes": {"time": 1791535800000}},
+        ),
+        SimpleNamespace(
+            state="on",
+            last_changed=datetime(2026, 10, 9, 14, 30, tzinfo=timezone.utc),
+            attributes={"last_event_attributes": {"timestamp": 1791536400}},
+        ),
+        SimpleNamespace(
+            state="on",
+            last_changed=datetime(2026, 10, 9, 14, 40, tzinfo=timezone.utc),
+            attributes={"last_event_attributes": {"time": 12345}},
+        ),
+    ]
+    monkeypatch.setattr(
+        recordings_http.history,
+        "state_changes_during_period",
+        lambda *args, **kwargs: {"binary_sensor.camera_person_detected": states},
+    )
+
+    assert recordings_http._person_detection_timestamps(
+        object(), "binary_sensor.camera_person_detected", day_start, day_end
+    ) == [1791535800, 1791536400, 1791556800]
+
+
+def test_person_detection_markers_prefer_camera_event_time_in_order(monkeypatch):
+    """Prefer event time, then payload timestamp, then Tuya DP receipt time."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from custom_components.tuya_recordings import http as recordings_http
+
+    start = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    end = datetime(2026, 10, 10, tzinfo=timezone.utc)
+    states = [
+        SimpleNamespace(
+            state="on",
+            last_changed=datetime(2026, 10, 9, 10, tzinfo=timezone.utc),
+            attributes={
+                "last_event_attributes": {
+                    "time": 1791535800000,
+                    "timestamp": 1791536400,
+                    "dp_timestamp": 1791537000,
+                }
+            },
+        ),
+        SimpleNamespace(
+            state="on",
+            last_changed=datetime(2026, 10, 9, 11, tzinfo=timezone.utc),
+            attributes={
+                "last_event_attributes": {
+                    "time": "not-an-epoch",
+                    "timestamp": 1791536400000,
+                    "dp_timestamp": 1791537000,
+                }
+            },
+        ),
+        SimpleNamespace(
+            state="on",
+            last_changed=datetime(2026, 10, 9, 12, tzinfo=timezone.utc),
+            attributes={"last_event_attributes": {"dp_timestamp": 1791537000000}},
+        ),
+    ]
+    query = {}
+
+    def history_rows(*_args, **kwargs):
+        query.update(kwargs)
+        return {"binary_sensor.fixture_person": states}
+
+    monkeypatch.setattr(
+        recordings_http.history, "state_changes_during_period", history_rows
+    )
+
+    assert recordings_http._person_detection_timestamps(
+        object(), "binary_sensor.fixture_person", start, end
+    ) == [1791535800, 1791536400, 1791537000]
+    assert query["no_attributes"] is False
+    assert query["include_start_time_state"] is False

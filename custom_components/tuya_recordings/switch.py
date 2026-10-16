@@ -77,13 +77,21 @@ class TuyaRecordingsCameraPauseSwitch(SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        if not self._media_sync_enabled:
-            return False
-        return bool(self.entry.options.get(CONF_CLOUD_ACTIVITY_PAUSED, self.entry.data.get(CONF_CLOUD_ACTIVITY_PAUSED, DEFAULT_CLOUD_ACTIVITY_PAUSED)))
+        return bool(
+            self.entry.options.get(
+                CONF_CLOUD_ACTIVITY_PAUSED,
+                self.entry.data.get(
+                    CONF_CLOUD_ACTIVITY_PAUSED,
+                    DEFAULT_CLOUD_ACTIVITY_PAUSED,
+                ),
+            )
+        )
 
     @property
     def available(self) -> bool:
-        return self._media_sync_enabled
+        # The master pause must remain usable in the default uncached timeline
+        # mode so a user can quiet catalog refresh and live SD playback.
+        return True
 
     @property
     def _media_sync_enabled(self) -> bool:
