@@ -3,7 +3,7 @@
   "name": "Tuya Recordings",
   "codeowners": ["@Wheemer"],
   "config_flow": true,
-  "dependencies": ["ffmpeg", "frontend", "http", "media_source", "panel_custom", "tuya"],
+  "dependencies": ["ffmpeg", "frontend", "http", "media_source", "panel_custom", "recorder", "tuya"],
   "documentation": "https://github.com/Wheemer/tuya-recordings",
   "integration_type": "hub",
   "iot_class": "cloud_polling",

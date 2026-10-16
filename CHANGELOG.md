@@ -18,6 +18,12 @@ Native playback and timeline reliability release.
 - Validates setup options and bounds camera background work through a
   serialized, one-camera-at-a-time dispatcher.
 
+### Fixes
+
+- Declares Home Assistant's recorder dependency used by the integration.
+- Runs every browser playback fixture and frontend syntax check in GitHub
+  Actions with the same repository import path as the Python suite.
+
 ## Tuya Recordings v0.4.1.4 (2026-10-05)
 
 Timeline playback seek correction.

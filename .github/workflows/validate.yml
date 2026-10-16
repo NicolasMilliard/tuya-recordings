@@ -41,9 +41,14 @@ jobs:
           python -m ruff check custom_components tests
           python -m pytest -q
       - name: Validate browser playback and layout
+        env:
+          PYTHONPATH: .
         run: |
           python tests/native_player.browser.py
+          python tests/timeline_panel.browser.py
           python tests/panel_style.browser.py
+          node --check custom_components/tuya_recordings/frontend/camera-player.js
+          node --check custom_components/tuya_recordings/frontend/panel.js
 
   hassfest:
     runs-on: ubuntu-latest
