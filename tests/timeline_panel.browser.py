@@ -150,6 +150,7 @@ def main() -> None:
                   return {
                     calls,
                     droppedValue,
+                    rangeStartValue: range.start - dayStart,
                     expectedValue: target - dayStart,
                     afterOldStreamUpdate,
                     afterReplacementStreamUpdate,
@@ -426,7 +427,8 @@ def main() -> None:
         assert drag_report["afterStalePlayerUpdate"] == drag_report["droppedValue"]
         assert len(resume_report["calls"]) == 1, resume_report
         assert resume_report["calls"][0]["start"] == 1790011833, resume_report
-        assert abs(resume_report["calls"][0]["offset"] - 5) <= 1, resume_report
+        dropped_offset = resume_report["droppedValue"] - resume_report["rangeStartValue"]
+        assert abs(resume_report["calls"][0]["offset"] - dropped_offset) <= 1, resume_report
         assert abs(resume_report["droppedValue"] - resume_report["expectedValue"]) <= 30, resume_report
         assert abs(resume_report["afterOldStreamUpdate"] - resume_report["droppedValue"]) <= 1, resume_report
         assert abs(resume_report["afterReplacementStreamUpdate"] - resume_report["expectedValue"]) <= 1, resume_report
