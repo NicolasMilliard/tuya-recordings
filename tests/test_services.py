@@ -102,7 +102,7 @@ def test_setup_discovers_cameras_from_device_registry_values(
         integration.er, "async_get", lambda hass: SimpleNamespace(entities=entities)
     )
     monkeypatch.setattr(
-        integration.dr, "async_get", lambda hass: SimpleNamespace(devices=devices)
+        integration.dr, "async_get", lambda hass: SimpleNamespace(devices=list(devices.values()), async_get=devices.get)
     )
     monkeypatch.setattr(integration, "_required_dependency_errors", lambda hass: set())
     monkeypatch.setattr(integration, "_async_update_dependency_issues", lambda *args: None)

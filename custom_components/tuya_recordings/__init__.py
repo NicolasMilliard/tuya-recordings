@@ -201,8 +201,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     @callback
     def update_camera_inventory(event=None):
+        device_registry = dr.async_get(hass)
+        entity_entries = list(er.async_get(hass).entities.values())
         client.set_camera_inventory(_official_tuya_camera_device_ids(
-            er.async_get(hass).entities.values(), dr.async_get(hass).devices.values(),
+            entity_entries,
+            [device_registry.async_get(entry.device_id) for entry in entity_entries if entry.device_id],
         ))
 
     await hass.async_add_executor_job(client.load_cache)
