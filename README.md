@@ -12,17 +12,17 @@
 ## What It Does
 
 Tuya Recordings adds SD-card recording playback to Home Assistant for cameras
-already set up in the official Home Assistant **Tuya** integration. It follows
-the selected Tuya mobile app's native recording path instead of relying on Tuya
-Cloud video storage or a separate camera bridge.
+already available through the official Home Assistant **Tuya** integration.
+It follows the selected Smart Life or Tuya Smart app's native camera protocol,
+rather than using Tuya Cloud video storage or a separate camera bridge.
 
-By default, choose a camera and day, then use one wall-clock timeline to play
-the SD-card recording at the selected time. Video and audio are remuxed for the
-browser without re-encoding, and the integration does not retain a full local
-copy.
+By default, choose a camera and date, then use a wall-clock timeline to play
+the recording at the selected time directly from the camera's SD card. Video
+and audio are remuxed for the browser without video re-encoding, and no local
+video copy is retained.
 
-Optional local caching is available for people who want a private MP4 library
-and fast repeat playback. It is off by default.
+Optional local caching creates a private MP4 library for fast repeat playback
+and Home Assistant Media Browser. It is off by default.
 
 > [!IMPORTANT]
 > This integration is for SD-card recordings. It does not replace the official
@@ -31,22 +31,26 @@ and fast repeat playback. It is off by default.
 
 ## Features
 
-- SD-card day and recording discovery through the Smart Life or Tuya Smart native playback
-  protocol.
-- Video and audio playback from one serialized camera session.
-- A compact custom panel with camera picker, date picker, wall-clock timeline,
-  recording ranges, keyboard seeking, and fullscreen controls.
+- SD-card day and recording discovery through the Smart Life or Tuya Smart
+  native playback protocol.
+- Video and audio playback through one serialized camera session.
+- A custom panel with camera picker, date picker, wall-clock timeline,
+  recording ranges, seeking, and fullscreen controls.
+- Person markers that appear only when an explicit camera person event falls
+  inside that camera's matching SD-card recording range. The panel does not
+  place markers from delayed Home Assistant receipt times.
 - Optional local MP4 caching under a private `/media` folder.
-- Cached recordings in Home Assistant Media Browser.
+- Cached recordings in Home Assistant Media Browser, with thumbnails rendered
+  locally from the cached MP4 files.
 - One **Camera events** entity per supported camera, preserving the original
   Tuya notification code and metadata in Home Assistant history.
 - Separate **Motion detected** and **Person detected** binary sensors for each
   camera, classified from the same Tuya IPC notifications.
-- A bounded, one-camera-at-a-time work queue for catalog refresh, thumbnail
-  work, and optional caching.
-- Smart Life or Tuya Smart QR authorization during setup. No Tuya Developer project or
-  LocalTuya camera entry is required.
-- No separate bridge, sidecar, or bundled executable.
+- A bounded, one-camera-at-a-time work queue for catalog refresh, playback,
+  local thumbnail work, and optional caching.
+- Smart Life or Tuya Smart QR authorization during setup. No Tuya Developer
+  project, LocalTuya camera entry, separate bridge, sidecar, or bundled
+  executable is required.
 
 ## Requirements
 
@@ -94,43 +98,65 @@ Restart Home Assistant, then add **Tuya Recordings** from **Settings > Devices
 The setup flow asks for:
 
 - **Account region**
-- **Account app**: Smart Life or Tuya Smart
+- **Account app**: **Smart Life** or **Tuya Smart**. Choose the app and account
+  that actually owns the cameras.
 - **Private video storage path**, normally `/media/tuya_recordings`
 - **Recording order**
 - **Pre-cache recordings**
 - **Sync window in hours** when pre-caching is enabled
 - **Detection reset time** (default: 60 seconds)
 
-It then shows one QR code. Scan it with the account app selected during setup, approve the login,
-and submit the Home Assistant step. The QR code is intentionally not polled or
-refreshed in the background. If it expires, restart setup to make a new code.
+The flow then displays one QR code. Scan it with the selected account app,
+approve the login, and submit the Home Assistant step. The code is not polled
+or refreshed in the background. If it expires, restart setup to create a new
+one.
 
 Use a private `/media` location for cached files. Do not use `/config/www`.
-Integration options also include **Background catalog interval** for uncached SD-card playback.
+
+### Options
+
+After setup, **Configure** on the Tuya Recordings integration provides:
+
+- **Days to check**: `0` scans all discoverable SD-card history; a higher value
+  limits catalog history.
+- **Background catalog interval**: 15 minutes to 24 hours for timeline mode.
+- **Pre-cache recordings** and **Sync window in hours** for local MP4 caching.
+  A window of `0` means every discovered recording.
+- **Private video storage path** and **Recording order**.
+- **Detection reset time** for the motion and person binary sensors.
+
+Changing the storage path takes effect immediately and does not move existing
+files. Move the old `videos` and `thumbs` folders before confirming a new path
+if those cached clips should remain available.
 
 ## Playback And Caching
 
 ### Default: SD-card timeline playback
 
-With **Pre-cache recordings** off, the panel reads the recording catalog and
-plays the selected time directly from the camera's SD card. There is one active
-camera session at a time: selecting another point stops the prior session
-before the next one begins. The background catalog pass is metadata-only; it
-does not download or retain video files. It defaults to every 15 minutes and
-can be made less frequent in integration options. A requested playback cancels
-an active background catalog command before opening its camera session.
+With **Pre-cache recordings** off, the panel requests the camera's recording
+catalog and plays the selected time directly from the SD card. It does not
+download or retain video or thumbnails locally.
+
+There is one active camera session at a time. Selecting a new time stops the
+prior playback before the next one begins. Catalog refresh is serialized with
+playback, and a playback request takes priority over a background catalog
+refresh. The default catalog interval is 15 minutes.
+
+Person markers are conservative by design: a marker is shown only when the
+camera's explicit person-event timestamp falls within a matching native
+SD-card recording range. A missing marker is preferable to a marker placed at
+the wrong moment.
 
 ### Optional: local MP4 cache
 
-With **Pre-cache recordings** on, Tuya Recordings downloads selected SD-card
-recordings into the configured private storage path. Cached clips appear in the
-panel and Home Assistant Media Browser, and their thumbnails are generated
-locally from the cached files. Set the sync window to `0` only when the storage
-location has enough free space for every discovered recording.
+With **Pre-cache recordings** on, Tuya Recordings downloads the selected
+SD-card recordings into the configured private storage path. Cached clips
+appear in the panel and Home Assistant Media Browser. Thumbnails are rendered
+locally from the cached MP4 files; no separate camera thumbnail request is
+made.
 
-Changing the storage path does not move existing files. Move the existing
-`videos` and `thumbs` folders before confirming the new path if you want to
-retain prior cached clips.
+Set the sync window to `0` only when the storage location has enough free
+space for every discovered recording.
 
 ## Camera Detection Entities
 
@@ -163,14 +189,14 @@ and ordinary motion/person automations.
 
 ## Safety And Camera Activity
 
-Camera work is serialized across Tuya Recordings and interactive playback takes
-priority over background work. The integration does not fan out parallel
-recording sessions across cameras.
+Camera work is serialized across Tuya Recordings; it never opens parallel
+recording sessions for the same camera. Interactive playback takes priority
+over background catalog and cache work.
 
-**Pause camera activity** stops every camera-facing action in either mode:
-catalog refresh, live SD playback, caching, and thumbnail work. Complete files
-already saved locally remain available. Turn it on while a camera is recovering
-or when you want Tuya Recordings completely quiet.
+**Pause camera activity** stops every camera-facing action: catalog refresh,
+uncached SD playback, caching, and thumbnail work. The panel can still show
+its existing metadata, and locally cached MP4 files remain playable. Turn it
+on while a camera is recovering or whenever Tuya Recordings should be quiet.
 
 ## Troubleshooting
 
@@ -178,17 +204,26 @@ or when you want Tuya Recordings completely quiet.
 
 - Confirm that the official Home Assistant Tuya integration is configured for
   the same account and exposes the camera.
-- Confirm that the camera has an SD card with recordings in Smart Life.
+- Confirm that the camera has an SD card with recordings in the selected
+  Smart Life or Tuya Smart app.
 
 **Camera authorization failed or expired**
 
-- Reconfigure Tuya Recordings and complete a fresh QR authorization.
+- Reconfigure Tuya Recordings and complete a fresh QR authorization with the
+  app selected in setup.
 
-**Playback is unavailable**
+**Timeline playback is unavailable**
 
 - Confirm the same time is playable in the selected account app.
 - Confirm Home Assistant's `ffmpeg` integration is available.
-- Check that **Pause camera activity** is off when using cached mode.
+- Confirm **Pause camera activity** is off. This switch intentionally blocks
+  camera-backed catalog and timeline work.
+
+**Person marker is missing or not expected**
+
+- The marker requires both an explicit camera person-event time and a matching
+  SD-card recording range. The integration deliberately does not guess from a
+  delayed Home Assistant notification time.
 
 **Cached clips do not appear**
 
