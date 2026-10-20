@@ -1,5 +1,15 @@
 # Changelog
 
+## Tuya Recordings v0.4.8 (2026-10-20)
+
+### Improvements
+
+- Discovers cameras from the Smart Life or Tuya Smart account authorized during
+  setup. New installations no longer require the official Home Assistant Tuya
+  integration.
+- Retains the legacy Home Assistant Tuya registry path for existing entries
+  until their next QR reauthorization records the native account inventory.
+
 ## Tuya Recordings v0.4.7 (2026-10-20)
 
 ### Fixes
