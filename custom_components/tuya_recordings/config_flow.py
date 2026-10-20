@@ -16,6 +16,7 @@ from .const import (
     CONF_ALERT_RESET_SECONDS,
     CONF_APP_PROFILE,
     CONF_CATALOG_SYNC_MINUTES,
+    CONF_DEVICE_INVENTORY,
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
     CONF_LOOKBACK_DAYS,
@@ -37,6 +38,7 @@ from .const import (
     MEDIA_VIEW_RECORDINGS_ORDER_OPTIONS,
     REGION_LABELS,
 )
+from .client import camera_inventory_from_native_devices
 from .lib.native_auth import NativeAuthorizationError, NativeQrAuthorization
 from .lib.native_gateway import (
     NativeAppGatewayClient,
@@ -46,7 +48,7 @@ from .lib.native_gateway import (
 
 
 class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
-    VERSION = 6
+    VERSION = 7
 
     def __init__(self) -> None:
         self._pending_entry_data: dict[str, Any] | None = None
@@ -58,11 +60,8 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        dependency_errors = _required_dependency_errors(self.hass)
         if user_input is not None:
             errors = _validate_form_input(user_input)
-            if dependency_errors:
-                errors["base"] = _dependency_error_key(dependency_errors)
             if errors:
                 return self.async_show_form(
                     step_id="user",
@@ -96,9 +95,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user",
             data_schema=_user_schema(user_input),
-            errors={"base": _dependency_error_key(dependency_errors)}
-            if dependency_errors
-            else {},
+            errors={},
         )
 
     async def async_step_native_authorize(
@@ -132,8 +129,9 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
             (
                 device_local_keys,
                 device_protocol_versions,
+                native_devices,
             ) = await self.hass.async_add_executor_job(
-                self._native_gateway.device_connection_data,
+                self._native_gateway.device_connection_inventory_data,
                 saved_session,
             )
         except NativeGatewayError:
@@ -147,6 +145,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_NATIVE_APP_SESSION: saved_session,
             CONF_DEVICE_LOCAL_KEYS: device_local_keys,
             CONF_DEVICE_PROTOCOL_VERSIONS: device_protocol_versions,
+            CONF_DEVICE_INVENTORY: camera_inventory_from_native_devices(native_devices),
         }
         self._native_gateway = None
         if self._reauth_entry is not None:
@@ -158,6 +157,7 @@ class TuyaRecordingsConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_DEVICE_PROTOCOL_VERSIONS: entry_data[
                         CONF_DEVICE_PROTOCOL_VERSIONS
                     ],
+                    CONF_DEVICE_INVENTORY: entry_data[CONF_DEVICE_INVENTORY],
                 },
             )
         await self.async_set_unique_id(f"{DOMAIN}_{saved_session['uid']}")
@@ -515,14 +515,3 @@ def _native_authorize_schema(payload: str) -> vol.Schema:
             )
         }
     )
-
-
-def _required_dependency_errors(hass) -> set[str]:
-    errors: set[str] = set()
-    if not hass.config_entries.async_entries("tuya"):
-        errors.add("tuya_required")
-    return errors
-
-
-def _dependency_error_key(errors: set[str]) -> str:
-    return "tuya_required" if "tuya_required" in errors else "unknown"

@@ -198,7 +198,7 @@ def test_device_connection_data_extracts_apk_mqtt_protocol(monkeypatch):
 
     monkeypatch.setattr(NativeAppGatewayClient, "call", fake_call)
 
-    keys, protocols = client.device_connection_data(
+    keys, protocols, inventory = client.device_connection_inventory_data(
         {
             "sid": "sid",
             "ecode": "ecode",
@@ -211,6 +211,13 @@ def test_device_connection_data_extracts_apk_mqtt_protocol(monkeypatch):
 
     assert keys == {"camera-a": "fresh-a"}
     assert protocols == {"camera-a": "2.3"}
+    assert inventory == [{
+        "devId": "camera-a",
+        "name": "camera-a",
+        "category": "",
+        "productId": "",
+        "online": None,
+    }]
 
 
 @pytest.mark.parametrize("homes", [None, {}, "invalid"])

@@ -46,6 +46,7 @@ CONF_APP_PROFILE = "app_profile"
 CONF_CLOUD_ACTIVITY_PAUSED = "cloud_activity_paused"
 CONF_REGION = "region"
 CONF_NATIVE_APP_SESSION = "native_app_session"
+CONF_DEVICE_INVENTORY = "device_inventory"
 CONF_DEVICE_LOCAL_KEYS = "device_local_keys"
 CONF_DEVICE_PROTOCOL_VERSIONS = "device_protocol_versions"
 

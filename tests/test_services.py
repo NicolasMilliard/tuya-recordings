@@ -2,15 +2,16 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-import pytest
 
 from custom_components import tuya_recordings as integration
 from custom_components.tuya_recordings import (
     _entries_for_call,
     _official_tuya_camera_device_ids,
-    _required_dependency_errors,
 )
-from custom_components.tuya_recordings.client import TuyaRecordingsClient
+from custom_components.tuya_recordings.client import (
+    TuyaRecordingsClient,
+    camera_inventory_from_native_devices,
+)
 from custom_components.tuya_recordings.const import DOMAIN
 
 
@@ -31,29 +32,14 @@ def test_entries_for_call_returns_requested_client_only():
     assert _entries_for_call(hass, "missing") == []
 
 
-class _ConfigEntries:
-    def __init__(self, entries_by_domain):
-        self._entries_by_domain = entries_by_domain
+def test_native_camera_inventory_uses_apk_metadata_without_probing_devices():
+    inventory = camera_inventory_from_native_devices([
+        {"devId": "doorbell", "name": "Front Door", "category": "sp"},
+        {"devId": "camera", "name": "Garage Camera", "category": "unknown"},
+        {"devId": "light", "name": "Kitchen Light", "category": "dj"},
+    ])
 
-    def async_entries(self, domain):
-        return self._entries_by_domain.get(domain, [])
-
-
-def test_required_dependency_errors_require_only_official_tuya():
-    hass = SimpleNamespace(config_entries=_ConfigEntries({}))
-
-    assert _required_dependency_errors(hass) == {"tuya_required"}
-
-    hass = SimpleNamespace(
-        config_entries=_ConfigEntries(
-            {
-                "tuya": [SimpleNamespace(data={})],
-            }
-        )
-    )
-
-    assert _required_dependency_errors(hass) == set()
-
+    assert inventory == {"doorbell": "Front Door", "camera": "Garage Camera"}
 
 def test_official_tuya_camera_device_ids_come_from_tuya_camera_entities():
     entity_entries = [
@@ -74,38 +60,7 @@ def test_official_tuya_camera_device_ids_come_from_tuya_camera_entities():
     }
 
 
-@pytest.mark.parametrize(
-    "registry_event", ["entity_registry_updated", "device_registry_updated"]
-)
-def test_setup_discovers_cameras_from_device_registry_values(
-    monkeypatch, tmp_path, registry_event
-):
-    entities = {
-        "camera.porch": SimpleNamespace(
-            platform="tuya", entity_id="camera.porch", device_id="registry-porch"
-        ),
-        "camera.garage": SimpleNamespace(
-            platform="tuya", entity_id="camera.garage", device_id="registry-garage"
-        ),
-    }
-    devices = {
-        "registry-porch": SimpleNamespace(
-            id="registry-porch", identifiers={("tuya", "tuya-porch")},
-            name="Porch Cam", name_by_user=None,
-        ),
-        "registry-garage": SimpleNamespace(
-            id="registry-garage", identifiers={("tuya", "tuya-garage")},
-            name="Garage Cam", name_by_user="Garage",
-        ),
-    }
-    monkeypatch.setattr(
-        integration.er, "async_get", lambda hass: SimpleNamespace(entities=entities)
-    )
-    monkeypatch.setattr(
-        integration.dr, "async_get", lambda hass: SimpleNamespace(devices=list(devices.values()), async_get=devices.get)
-    )
-    monkeypatch.setattr(integration, "_required_dependency_errors", lambda hass: set())
-    monkeypatch.setattr(integration, "_async_update_dependency_issues", lambda *args: None)
+def test_setup_prefers_persisted_native_app_camera_inventory(monkeypatch, tmp_path):
     monkeypatch.setattr(integration, "_async_update_camera_repair_issues", lambda *args: None)
     monkeypatch.setattr(integration, "native_app_session", lambda data: None)
     monkeypatch.setattr(integration, "_async_register_services", lambda hass: None)
@@ -114,32 +69,24 @@ def test_setup_discovers_cameras_from_device_registry_values(
     monkeypatch.setattr(integration, "async_register_frontend", AsyncMock())
     client = Mock()
     monkeypatch.setattr(integration, "TuyaRecordingsClient", Mock(return_value=client))
-    listeners = {}
-
-    def listen(event, callback):
-        listeners[event] = callback
-        return Mock()
-
     hass = SimpleNamespace(
         config=SimpleNamespace(path=lambda *parts: str(tmp_path.joinpath(*parts))),
         config_entries=SimpleNamespace(async_forward_entry_setups=AsyncMock()),
-        bus=SimpleNamespace(async_listen=listen),
+        bus=SimpleNamespace(async_listen=Mock()),
         async_add_executor_job=AsyncMock(),
         data={},
     )
     entry = SimpleNamespace(
-        entry_id="entry", data={}, options={}, async_on_unload=Mock(),
+        entry_id="entry",
+        data={"device_inventory": {"tuya-porch": "Porch Cam", "tuya-garage": "Garage"}},
+        options={},
+        async_on_unload=Mock(),
         add_update_listener=Mock(return_value=Mock()),
     )
 
     assert asyncio.run(integration.async_setup_entry(hass, entry)) is True
-    expected = {"tuya-porch": "Porch Cam", "tuya-garage": "Garage"}
-    client.set_camera_inventory.assert_called_once_with(expected)
-
-    client.set_camera_inventory.reset_mock()
-    devices["registry-garage"].name_by_user = "Renamed Garage"
-    listeners[registry_event]()
     client.set_camera_inventory.assert_called_once_with(
-        {"tuya-porch": "Porch Cam", "tuya-garage": "Renamed Garage"}
+        {"tuya-porch": "Porch Cam", "tuya-garage": "Garage"},
+        source="native_app_inventory",
     )
 

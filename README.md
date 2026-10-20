@@ -14,9 +14,9 @@
 Tuya Recordings adds SD-card recording playback to Home Assistant for compatible
 Smart Life and Tuya Smart cameras. Playback follows the selected account app's
 native camera protocol, rather than using Tuya Cloud video storage or a
-separate camera bridge. The official Home Assistant **Tuya** integration is
-used to discover the cameras; Tuya Recordings authorizes and runs SD playback
-through its own QR-authorized session.
+separate camera bridge. Tuya Recordings discovers compatible cameras during
+its own QR-authorized account setup and runs SD playback through that same
+native session.
 
 By default, choose a camera and date, then use a wall-clock timeline to play
 the recording at the selected time directly from the camera's SD card. Video
@@ -56,16 +56,15 @@ and Home Assistant Media Browser. It is off by default.
 
 ## Requirements
 
-- Home Assistant with the official **Tuya** integration configured for the
-  same Smart Life / Tuya account.
+- Home Assistant.
 - A Tuya / Smart Life camera with an SD card and recordings.
 - The app that contains the cameras, used once during setup to approve the QR code.
 - Home Assistant's `ffmpeg` integration. It remuxes the camera's existing
   encoded streams for browser playback; it does not transcode them.
 
-LocalTuya may coexist for other local controls, but it is not a Tuya Recordings
-requirement. Tuya Developer OpenAPI services and Tuya Cloud video storage are
-also not required.
+The official Home Assistant **Tuya** integration and LocalTuya may coexist for
+other controls, but neither is a Tuya Recordings requirement. Tuya Developer
+OpenAPI services and Tuya Cloud video storage are also not required.
 
 ## Installation
 
@@ -204,8 +203,7 @@ on while a camera is recovering or whenever Tuya Recordings should be quiet.
 
 **No cameras or setup cannot continue**
 
-- Confirm that the official Home Assistant Tuya integration is configured for
-  the same account and exposes the camera.
+- Confirm that the selected Smart Life or Tuya Smart account owns the camera.
 - Confirm that the camera has an SD card with recordings in the selected
   Smart Life or Tuya Smart app.
 

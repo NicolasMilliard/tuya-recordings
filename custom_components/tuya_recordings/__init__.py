@@ -10,7 +10,7 @@ import voluptuous as vol
 from homeassistant.components import frontend as ha_frontend
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryError
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -27,6 +27,7 @@ from .const import (
     CATALOG_SYNC_STARTUP_DELAY,
     CONF_APP_PROFILE,
     CONF_CLOUD_ACTIVITY_PAUSED,
+    CONF_DEVICE_INVENTORY,
     CONF_DEVICE_LOCAL_KEYS,
     CONF_DEVICE_PROTOCOL_VERSIONS,
     CONF_MEDIA_SYNC_ENABLED,
@@ -111,7 +112,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Migrate older Tuya Recordings config entries."""
     stale_keys = STALE_ENTRY_KEYS
     data = dict(entry.data)
-    changed = entry.version < 6 or bool(stale_keys.intersection(data))
+    changed = entry.version < 7 or bool(stale_keys.intersection(data))
     if CONF_APP_PROFILE not in data:
         data[CONF_APP_PROFILE] = "smart_life"
         changed = True
@@ -144,7 +145,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             changed = True
 
     if changed:
-        hass.config_entries.async_update_entry(entry, data=data, version=6)
+        hass.config_entries.async_update_entry(entry, data=data, version=7)
     return True
 
 
@@ -181,10 +182,6 @@ def _read_native_session_import(path: Path) -> dict | None:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    dependency_errors = _required_dependency_errors(hass)
-    _async_update_dependency_issues(hass, dependency_errors)
-    if dependency_errors:
-        raise ConfigEntryError("Tuya Recordings requires the official Tuya integration")
     _async_update_camera_repair_issues(hass)
 
     cache_path = Path(hass.config.path(".storage", DOMAIN, f"{entry.entry_id}_recordings.json"))
@@ -199,19 +196,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         cache_path=cache_path,
         hass=hass,
     )
-    @callback
-    def update_camera_inventory(event=None):
-        device_registry = dr.async_get(hass)
-        entity_entries = list(er.async_get(hass).entities.values())
-        client.set_camera_inventory(_official_tuya_camera_device_ids(
-            entity_entries,
-            [device_registry.async_get(entry.device_id) for entry in entity_entries if entry.device_id],
-        ))
+    native_inventory = _native_camera_inventory(entry_data)
+    if native_inventory is not None:
+        client.set_camera_inventory(native_inventory, source="native_app_inventory")
+    else:
+        # Entries created before v7 lack this setup-time inventory. Retain their
+        # legacy registry behavior until reauthorization records it.
+        @callback
+        def update_legacy_camera_inventory(event=None):
+            device_registry = dr.async_get(hass)
+            entity_entries = list(er.async_get(hass).entities.values())
+            client.set_camera_inventory(
+                _official_tuya_camera_device_ids(
+                    entity_entries,
+                    [device_registry.async_get(entity.device_id) for entity in entity_entries if entity.device_id],
+                ),
+                source="legacy_official_tuya_registry",
+            )
+
+        update_legacy_camera_inventory()
+        entry.async_on_unload(hass.bus.async_listen("entity_registry_updated", update_legacy_camera_inventory))
+        entry.async_on_unload(hass.bus.async_listen("device_registry_updated", update_legacy_camera_inventory))
 
     await hass.async_add_executor_job(client.load_cache)
-    update_camera_inventory()
-    entry.async_on_unload(hass.bus.async_listen("entity_registry_updated", update_camera_inventory))
-    entry.async_on_unload(hass.bus.async_listen("device_registry_updated", update_camera_inventory))
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"client": client, "entry": entry}
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
     _async_register_services(hass)
@@ -251,31 +258,24 @@ def _entry_runtime_data(entry: ConfigEntry) -> dict:
     return runtime
 
 
-def _required_dependency_errors(hass: HomeAssistant) -> set[str]:
-    errors: set[str] = set()
-    if not hass.config_entries.async_entries("tuya"):
-        errors.add("tuya_required")
-    return errors
-
-
-def _async_update_dependency_issues(hass: HomeAssistant, dependency_errors: set[str]) -> None:
-    all_issues = {"tuya_required", "localtuya_required", "localtuya_cloud_credentials_required"}
-    for issue_id in all_issues - dependency_errors:
-        ir.async_delete_issue(hass, DOMAIN, issue_id)
-    for issue_id in dependency_errors:
-        ir.async_create_issue(
-            hass,
-            DOMAIN,
-            issue_id,
-            is_fixable=False,
-            severity=ir.IssueSeverity.ERROR,
-            translation_key=issue_id,
-        )
-
-
 def _async_update_camera_repair_issues(hass: HomeAssistant) -> None:
     # Older releases incorrectly warned that cameras needed LocalTuya entries.
     ir.async_delete_issue(hass, DOMAIN, "localtuya_camera_setup_incomplete")
+
+
+def _native_camera_inventory(entry_data: dict) -> dict[str, str] | None:
+    value = entry_data.get(CONF_DEVICE_INVENTORY)
+    if not isinstance(value, dict):
+        return None
+    inventory = {
+        str(device_id): str(name)
+        for device_id, name in value.items()
+        if isinstance(device_id, str)
+        and device_id.strip()
+        and isinstance(name, str)
+        and name.strip()
+    }
+    return inventory or None
 
 
 def _official_tuya_camera_device_ids(entity_entries, device_entries) -> dict[str, str]:

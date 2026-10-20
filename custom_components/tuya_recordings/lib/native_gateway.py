@@ -211,24 +211,27 @@ class NativeAppGatewayClient:
 
     def device_local_keys(self, saved: Any) -> dict[str, str]:
         """Return current device local keys using the APK account APIs."""
-        local_keys, _protocol_versions = self.device_connection_data(saved)
+        local_keys, _protocol_versions, _devices = self.device_connection_inventory_data(saved)
         return local_keys
 
     def device_connection_data(
         self, saved: Any
     ) -> tuple[dict[str, str], dict[str, str]]:
-        """Return local keys and MQTT protocol versions from the selected Tuya app.
+        """Return current device local keys and MQTT protocol versions."""
+        local_keys, protocol_versions, _devices = self.device_connection_inventory_data(saved)
+        return local_keys, protocol_versions
 
-        Only an explicit device ``pv`` is accepted. ``moduleMap.wifi.pv`` is
-        module/OTA metadata and is not the communication-mode value copied
-        into ``DeviceBean.pv`` by Smart Life.
-        """
+    def device_connection_inventory_data(
+        self, saved: Any
+    ) -> tuple[dict[str, str], dict[str, str], list[dict[str, Any]]]:
+        """Capture the APK-native account inventory at setup or reauthorization."""
         app_session = _saved_session(saved)
         homes = self.call("tuya.m.location.list", "2.1", {}, app_session)
         if not isinstance(homes, list):
             raise NativeGatewayProtocolError("Tuya mobile app home list was malformed")
         found: dict[str, str] = {}
         protocol_versions: dict[str, str] = {}
+        inventory: list[dict[str, Any]] = []
         seen: set[int] = set()
         for home in homes:
             if not isinstance(home, dict) or type(home.get("gid")) is not int:
@@ -238,33 +241,33 @@ class NativeAppGatewayClient:
                 continue
             seen.add(gid)
             devices = self.call(
-                "tuya.m.my.group.device.list",
-                "1.0",
-                {},
-                app_session,
-                {"gid": str(gid)},
+                "tuya.m.my.group.device.list", "1.0", {}, app_session, {"gid": str(gid)}
             )
             if not isinstance(devices, list):
-                raise NativeGatewayProtocolError(
-                    "Tuya mobile app device list was malformed"
-                )
+                raise NativeGatewayProtocolError("Tuya mobile app device list was malformed")
             for device in devices:
                 if not isinstance(device, dict):
                     continue
                 dev_id = device.get("devId")
                 local_key = device.get("localKey")
-                if (
-                    isinstance(dev_id, str)
-                    and dev_id.strip()
-                    and isinstance(local_key, str)
-                    and local_key.strip()
+                if not (
+                    isinstance(dev_id, str) and dev_id.strip()
+                    and isinstance(local_key, str) and local_key.strip()
                 ):
-                    normalized_id = dev_id.strip()
-                    found[normalized_id] = local_key.strip()
-                    protocol_version = _device_mqtt_protocol_version(device)
-                    if protocol_version is not None:
-                        protocol_versions[normalized_id] = protocol_version
-        return found, protocol_versions
+                    continue
+                dev_id = dev_id.strip()
+                found[dev_id] = local_key.strip()
+                protocol_version = _device_mqtt_protocol_version(device)
+                if protocol_version is not None:
+                    protocol_versions[dev_id] = protocol_version
+                inventory.append({
+                    "devId": dev_id,
+                    "name": str(device.get("name") or device.get("deviceName") or dev_id),
+                    "category": str(device.get("category") or ""),
+                    "productId": str(device.get("productId") or device.get("product_id") or ""),
+                    "online": device.get("online"),
+                })
+        return found, protocol_versions, inventory
 
     def _build_params(
         self,

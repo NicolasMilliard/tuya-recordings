@@ -45,7 +45,7 @@ def test_migration_removes_stale_rtsp_port():
 
     assert asyncio.run(async_migrate_entry(hass, entry))
 
-    assert hass.config_entries.calls == [(entry, {"data": {"app_profile": "smart_life"}, "version": 6})]
+    assert hass.config_entries.calls == [(entry, {"data": {"app_profile": "smart_life"}, "version": 7})]
 
 
 def test_migration_removes_stale_website_host_from_current_entries():
@@ -54,7 +54,7 @@ def test_migration_removes_stale_website_host_from_current_entries():
 
     assert asyncio.run(async_migrate_entry(hass, entry))
 
-    assert hass.config_entries.calls == [(entry, {"data": {"app_profile": "smart_life"}, "version": 6})]
+    assert hass.config_entries.calls == [(entry, {"data": {"app_profile": "smart_life"}, "version": 7})]
 
 
 def test_version_four_protocol_inference_is_removed():
@@ -67,7 +67,7 @@ def test_version_four_protocol_inference_is_removed():
 
     assert asyncio.run(async_migrate_entry(hass, entry))
 
-    assert hass.config_entries.calls == [(entry, {"data": {"app_profile": "smart_life"}, "version": 6})]
+    assert hass.config_entries.calls == [(entry, {"data": {"app_profile": "smart_life"}, "version": 7})]
 
 
 def test_migration_imports_saved_native_session_once(tmp_path):
@@ -92,6 +92,16 @@ def test_migration_imports_saved_native_session_once(tmp_path):
     assert asyncio.run(async_migrate_entry(hass, entry))
 
     assert hass.config_entries.calls == [
-        (entry, {"data": {"region": "us", "app_profile": "smart_life", **payload}, "version": 6})
+        (entry, {"data": {"region": "us", "app_profile": "smart_life", **payload}, "version": 7})
     ]
     assert not import_path.exists()
+
+def test_version_six_entry_advances_to_seven():
+    hass = type("FakeHass", (), {"config_entries": FakeConfigEntries()})()
+    entry = type("VersionSixEntry", (), {"version": 6, "data": {"app_profile": "smart_life"}})()
+
+    assert asyncio.run(async_migrate_entry(hass, entry))
+
+    assert hass.config_entries.calls == [
+        (entry, {"data": {"app_profile": "smart_life"}, "version": 7})
+    ]

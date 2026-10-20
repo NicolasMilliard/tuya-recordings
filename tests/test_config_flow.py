@@ -10,10 +10,8 @@ except ImportError:
 from homeassistant.helpers import config_validation as cv
 
 from custom_components.tuya_recordings.config_flow import (
-    _dependency_error_key,
     _native_authorize_schema,
     _options_schema,
-    _required_dependency_errors,
     _user_schema,
     _validate_form_input,
 )
@@ -130,23 +128,6 @@ def test_form_validation_normalizes_numeric_option_values():
     assert _validate_form_input(user_input) == {}
     assert user_input[CONF_CATALOG_SYNC_MINUTES] == 30
     assert user_input[CONF_ALERT_RESET_SECONDS] == 75
-
-
-def test_setup_requires_official_tuya_but_not_localtuya():
-    class Entries:
-        def __init__(self, entries):
-            self.entries = entries
-
-        def async_entries(self, domain):
-            return self.entries.get(domain, [])
-
-    hass = SimpleNamespace(config_entries=Entries({"localtuya": [object()]}))
-    errors = _required_dependency_errors(hass)
-    assert errors == {"tuya_required"}
-    assert _dependency_error_key(errors) == "tuya_required"
-
-    hass = SimpleNamespace(config_entries=Entries({"tuya": [object()]}))
-    assert _required_dependency_errors(hass) == set()
 
 
 def test_options_default_to_safe_catalog_interval():

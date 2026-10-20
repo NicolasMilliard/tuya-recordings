@@ -90,6 +90,29 @@ TuyaRecordingsAuthError = RecordingBackendAuthError
 TuyaRecordingsApiError = RuntimeError
 
 
+def camera_inventory_from_native_devices(devices: list[dict[str, Any]]) -> dict[str, str]:
+    """Select cameras from the account list captured by the APK-native setup."""
+    cameras: dict[str, str] = {}
+    for device in devices:
+        dev_id = str(device.get("devId") or device.get("deviceId") or "").strip()
+        if not dev_id:
+            continue
+        category = str(device.get("category") or "").strip().lower()
+        name = str(device.get("name") or device.get("deviceName") or dev_id).strip()
+        product = str(device.get("productId") or device.get("product_id") or "").strip()
+        category_match = category in KNOWN_CAMERA_CATEGORIES or any(
+            hint in category for hint in KNOWN_CAMERA_CATEGORY_HINTS
+        )
+        name_match = any(
+            hint in value.lower()
+            for value in (name, product)
+            for hint in CAMERA_NAME_HINTS
+        )
+        if category_match or name_match:
+            cameras[dev_id] = name or dev_id
+    return cameras
+
+
 class TuyaRecordingsClient:
     def __init__(
         self,
@@ -101,6 +124,7 @@ class TuyaRecordingsClient:
     ) -> None:
         self._closed = False
         self._camera_inventory: dict[str, str] | None = None
+        self._camera_inventory_source = "unconfigured"
         self._lifecycle_lock = threading.RLock()
         self._cloud_pause_event = threading.Event()
         self._background_pause_event = threading.Event()
@@ -519,7 +543,7 @@ class TuyaRecordingsClient:
     def diagnostics(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         return {
-            "camera_inventory_source": "official_tuya_registry",
+            "camera_inventory_source": self._camera_inventory_source,
             "region": self.region,
             "camera_inventory_count": len(self._camera_inventory or {}),
             "lookback_days": self.lookback_days,
@@ -1424,7 +1448,7 @@ class TuyaRecordingsClient:
 
     def validate_session(self) -> dict[str, Any]:
         return {
-            "source": "official_tuya_registry",
+            "source": self._camera_inventory_source,
             "devices": len(self._camera_inventory or {}),
         }
 
@@ -1514,11 +1538,14 @@ class TuyaRecordingsClient:
                 pass
         return stale
 
-    def set_camera_inventory(self, cameras: dict[str, str]) -> None:
-        """Replace the HA registry snapshot without accessing HA from workers."""
+    def set_camera_inventory(
+        self, cameras: dict[str, str], *, source: str = "native_app_inventory"
+    ) -> None:
+        """Replace the setup-time camera inventory without accessing HA from workers."""
         snapshot = dict(cameras)
-        if snapshot != self._camera_inventory:
+        if snapshot != self._camera_inventory or source != self._camera_inventory_source:
             self._camera_inventory = snapshot
+            self._camera_inventory_source = source
             self._camera_index_cache_until = datetime.min.replace(tzinfo=timezone.utc)
             self._browse_devices_until = 0.0
 
