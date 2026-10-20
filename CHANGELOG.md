@@ -1,5 +1,17 @@
 # Changelog
 
+## Tuya Recordings v0.4.7 (2026-10-20)
+
+### Fixes
+
+- Anchors person-detection markers to explicit camera event times that fall
+  within the camera's SD-card recording catalog. Home Assistant receipt times
+  and Tuya DP receipt times no longer create misleading timeline markers.
+- Preserves camera event-catalog metadata in the timeline response.
+- Reuses a camera session when playback takes over from a cancelled catalog
+  refresh, while keeping ordinary interactive playback connection attempts
+  promptly cancellable.
+
 ## Tuya Recordings v0.4.6 (2026-10-20)
 
 ### Fixes
