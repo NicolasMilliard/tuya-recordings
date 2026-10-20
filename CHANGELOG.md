@@ -1,5 +1,14 @@
 # Changelog
 
+## Tuya Recordings v0.4.6 (2026-10-20)
+
+### Fixes
+
+- Uses Home Assistant's device-registry lookup API when resolving cameras from
+  the official Tuya integration, avoiding a deprecated registry access pattern.
+- Moves normal playback and frontend request traces to debug logging so routine
+  use does not generate warning-level log noise.
+
 ## Tuya Recordings v0.4.5 (2026-10-20)
 
 Corrective HACS package release.
