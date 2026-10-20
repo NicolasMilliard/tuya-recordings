@@ -1,14 +1,19 @@
 # Changelog
 
-## Tuya Recordings v0.4.4 (2026-10-20)
+## Tuya Recordings v0.4.5 (2026-10-20)
 
-Playback reliability correction.
+Corrective HACS package release.
 
 ### Fixes
 
 - Ignores zero-length audio and video media frames after native playback
   decryption, while retaining errors for invalid decryption and unknown frame
   types. Valid subsequent media continues playing normally.
+
+- Restores the flat HACS ZIP layout, with manifest.json, __init__.py, and
+  frontend files at the archive root.
+- Adds release-archive validation so nested custom_components/tuya_recordings
+  paths cannot be published.
 
 ## Tuya Recordings v0.4.3 (2026-10-20)
 

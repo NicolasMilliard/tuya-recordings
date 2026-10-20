@@ -40,6 +40,9 @@ jobs:
           PY
           python -m ruff check custom_components tests
           python -m pytest -q
+      - name: Validate HACS release archive layout
+        run: |
+          python tools/build_release_zip.py --output "$RUNNER_TEMP/tuya_recordings.zip"
       - name: Validate browser playback and layout
         env:
           PYTHONPATH: .
