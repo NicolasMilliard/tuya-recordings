@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import threading
 import time
@@ -29,10 +30,12 @@ class NativeRelayRuntimeError(RuntimeError):
 
 
 _PLAYBACK_IDLE_SECONDS = 8.0
+_MAX_CONSECUTIVE_EMPTY_MEDIA_FRAMES = 128
 _POOL_CLOSE_TIMEOUT_SECONDS = 2.0
 _PLAYBACK_STOP_TIMEOUT_SECONDS = 5.0
 _THUMBNAIL_DEADLINE_GRACE_SECONDS = 1.0
 _STOP_WORKER = object()
+_LOGGER = logging.getLogger(__name__)
 
 
 class _CancellationGroup:
@@ -1016,6 +1019,7 @@ class NativeRelayRuntimeSession:
         video_deadline = loop.time() + self.first_frame_timeout
         saw_audio = False
         saw_video = False
+        empty_media_frames = 0
         deferred_command: tuple[str, NativePlaybackRequest | None] | None = None
         try:
             await self._wait_cancelable(
@@ -1094,6 +1098,7 @@ class NativeRelayRuntimeSession:
                     audio_codec_info = None
                     saw_audio = False
                     saw_video = False
+                    empty_media_frames = 0
                     video_deadline = loop.time() + self.first_frame_timeout
                     await self._wait_cancelable(
                         playback.seek(
@@ -1131,18 +1136,28 @@ class NativeRelayRuntimeSession:
                 frame = receive_task.result()
                 receive_task = None
                 if frame.is_audio:
-                    saw_audio = True
                     if frame.codec_info is not None:
                         audio_codec_info = frame.codec_info
                     elif audio_codec_info is not None:
                         frame = replace(frame, codec_info=audio_codec_info)
-                else:
-                    saw_video = True
                 converted = self._convert_frame(
                     frame,
                     playback_secrets,
                     recording_uuid,
                 )
+                if converted is None:
+                    empty_media_frames += 1
+                    # Do not let an active camera stream only empty frames forever.
+                    if empty_media_frames > _MAX_CONSECUTIVE_EMPTY_MEDIA_FRAMES:
+                        raise NativeRelayRuntimeError(
+                            "Camera sent too many consecutive empty playback frames"
+                        )
+                    continue
+                empty_media_frames = 0
+                if frame.is_audio:
+                    saw_audio = True
+                else:
+                    saw_video = True
                 sink.frame(converted)
         finally:
             if receive_task is not None:
@@ -1187,6 +1202,17 @@ class NativeRelayRuntimeSession:
             raise NativeRelayRuntimeError(
                 f"Native playback media decryption failed: {err}"
             ) from err
+        # A zero-length wire payload or a valid all-padding encrypted payload
+        # contains no media. Leave other frame types to the converter to reject.
+        if not decrypted.payload and frame.frame_type in (1, 3):
+            _LOGGER.debug(
+                "Ignoring empty native playback media frame: origin=%s "
+                "frame_type=%d wire_payload_length=%d",
+                "decrypted" if frame.payload else "wire",
+                frame.frame_type,
+                len(frame.payload),
+            )
+            return None
         return playback_stream_frame(decrypted)
 
     async def _recordings_for_day(self, day: date) -> list[dict[str, Any]]:
@@ -1298,17 +1324,9 @@ class NativeRelayRuntimeSession:
                     audio_codec_info = frame.codec_info
                 elif audio_codec_info is not None:
                     frame = replace(frame, codec_info=audio_codec_info)
-            try:
-                frame = decrypt_playback_frame(
-                    frame,
-                    playback_secrets,
-                    recording_uuid=recording_uuid,
-                )
-            except NativeMediaCryptoError as err:
-                raise NativeRelayRuntimeError(
-                    f"Native playback media decryption failed: {err}"
-                ) from err
-            converted = playback_stream_frame(frame)
+            converted = self._convert_frame(frame, playback_secrets, recording_uuid)
+            if converted is None:
+                continue
             if media_deadline is None:
                 media_deadline = loop.time() + max(float(duration), 0.1)
             info = converted.info or {}
