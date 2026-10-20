@@ -441,7 +441,7 @@ def test_native_backend_extracts_thumbnail_from_playback_stream(tmp_path):
     assert session.closed is True
 
 
-def test_native_backend_rejects_thumbnail_without_event_timeline_capability(tmp_path):
+def test_native_backend_keeps_direct_thumbnail_separate_from_event_timeline(tmp_path):
     opened = []
 
     def legacy_config(dev_id):
@@ -465,14 +465,14 @@ def test_native_backend_rejects_thumbnail_without_event_timeline_capability(tmp_
     )
     output = tmp_path / "thumb.jpg"
 
-    with pytest.raises(
-        RecordingBackendUnavailable,
-        match="does not advertise direct recording JPEG transfer",
-    ):
-        backend.receive_thumbnail("camera", {}, {}, 10, 20, output)
+    # The Smart Life SDK does not gate direct image requests on event-timeline
+    # support. A successful native JPEG response is the only support signal.
+    assert backend.event_catalog_available("camera") is False
 
-    assert opened == []
-    assert not output.exists()
+    backend.receive_thumbnail("camera", {}, {}, 10, 20, output)
+
+    assert len(opened) == 1
+    assert output.read_bytes() == jpeg_bytes()
 
 
 def test_native_backend_accepts_thumbnail_with_event_timeline_capability(tmp_path):

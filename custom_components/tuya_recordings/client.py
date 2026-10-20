@@ -565,10 +565,6 @@ class TuyaRecordingsClient:
             return None
         return self.create_thumbnail(dev_id, start, end)
 
-    def _direct_thumbnail_available(self, dev_id: str) -> bool:
-        check = getattr(self._recordings_backend, "direct_thumbnail_available", None)
-        return bool(callable(check) and check(dev_id))
-
     def _indexed_clip(
         self, dev_id: str, start: int, end: int
     ) -> dict[str, Any] | None:

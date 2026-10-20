@@ -1,5 +1,18 @@
 # Changelog
 
+## Tuya Recordings v0.4.3 (2026-10-20)
+
+Corrective camera discovery and native capability release.
+
+### Fixes
+
+- Discovers cameras from Home Assistant's device-registry entry values, fixing
+  installations where Tuya Recordings reported no cameras despite cameras being
+  available through the official Tuya integration.
+- Keeps event-timeline capability separate from native recording-image handling.
+  Normal cached thumbnails continue to be generated locally from successfully
+  cached MP4 files without opening an additional camera session.
+
 ## Tuya Recordings v0.4.2 (2026-10-16)
 
 Native playback and timeline reliability release.

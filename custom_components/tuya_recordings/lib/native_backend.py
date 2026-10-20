@@ -136,8 +136,8 @@ class RecordingBackend(Protocol):
     ) -> None:
         """Decode one JPEG from the selected clip's playback stream."""
 
-    def direct_thumbnail_available(self, dev_id: str) -> bool:
-        """Return whether camera firmware advertises direct JPEG transfer."""
+    def event_catalog_available(self, dev_id: str) -> bool:
+        """Return whether camera firmware advertises an event timeline."""
 
 
 class NativeCameraSession(Protocol):
@@ -189,7 +189,7 @@ class NativeBackendNotConfigured:
     def receive_thumbnail_from_stream(self, *args: Any, **kwargs: Any) -> None:
         raise RecordingBackendUnavailable(self.reason)
 
-    def direct_thumbnail_available(self, dev_id: str) -> bool:
+    def event_catalog_available(self, dev_id: str) -> bool:
         del dev_id
         return False
 
@@ -237,8 +237,8 @@ class ApkNativeRecordingBackend:
         if self._provider.close is not None:
             self._provider.close()
 
-    def direct_thumbnail_available(self, dev_id: str) -> bool:
-        """Match Smart Life's event-timeline gate for recording JPEGs."""
+    def event_catalog_available(self, dev_id: str) -> bool:
+        """Return whether the camera advertises Smart Life's event timeline."""
         try:
             return self._provider.session_config(dev_id).event_catalog_supported
         except NativeCameraConfigAuthError as err:
@@ -259,7 +259,7 @@ class ApkNativeRecordingBackend:
         day: date,
     ) -> list[dict[str, Any]]:
         del config, auth
-        event_catalog = self.direct_thumbnail_available(dev_id)
+        event_catalog = self.event_catalog_available(dev_id)
         with self._open_session(dev_id, None) as session:
             ordinary = _normalize_recordings(
                 self._call_required(session, "recordings_for_day", "getRecordFragmentsByDay")(day),
@@ -289,7 +289,7 @@ class ApkNativeRecordingBackend:
         del config, auth
         if days != newest_first_days(days):
             raise ValueError("Recording catalog days must be unique and newest first")
-        event_catalog = self.direct_thumbnail_available(dev_id)
+        event_catalog = self.event_catalog_available(dev_id)
         results: list[tuple[date, list[dict[str, Any]]]] = []
         with self._open_session(dev_id, cancel_event) as session:
             query_many = getattr(session, "recordings_for_days", None)
@@ -441,10 +441,6 @@ class ApkNativeRecordingBackend:
         output_path: Path,
     ) -> None:
         del config, auth
-        if not self.direct_thumbnail_available(dev_id):
-            raise RecordingBackendUnavailable(
-                "Camera firmware does not advertise direct recording JPEG transfer"
-            )
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = output_path.with_suffix(f"{output_path.suffix}.tmp")
