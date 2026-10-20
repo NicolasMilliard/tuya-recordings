@@ -252,6 +252,7 @@ class CancelDuringConnectPlayback(Playback):
         self.cancel = cancel
 
     async def connect(self, *, media=True):
+        self.connect_modes.append(media)
         self.cancel.set()
         await asyncio.sleep(0.2)
 
@@ -649,9 +650,37 @@ def test_worker_keeps_connected_transport_when_catalog_is_cancelled():
 
     with pytest.raises(NativeRelayRuntimeError, match="cancelled"):
         worker.catalog([date(2026, 9, 16)], cancel)
-    worker.catalog([date(2026, 9, 16)], None)
+
+    commands: queue.Queue[tuple[str, NativePlaybackRequest | None]] = queue.Queue()
+    commands.put(("stop", None))
+    worker.interactive_stream(
+        NativePlaybackRequest(start=100, end=110),
+        lambda event: None,
+        commands,
+        None,
+    )
 
     assert len(playbacks) == 1
+    assert playbacks[0].connect_modes == [True]
+    worker.close()
+
+
+def test_worker_cancels_interactive_connect_promptly():
+    cancel = threading.Event()
+    worker = NativeRelayPlaybackWorker(
+        camera_config(),
+        APP_SESSION,
+        playback_factory=lambda *args, **kwargs: CancelDuringConnectPlayback(cancel),
+    )
+
+    with pytest.raises(NativeRelayRuntimeError, match="cancelled"):
+        worker.interactive_stream(
+            NativePlaybackRequest(start=100, end=110),
+            lambda event: None,
+            queue.Queue(),
+            cancel,
+        )
+
     worker.close()
 
 

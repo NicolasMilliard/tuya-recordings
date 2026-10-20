@@ -481,7 +481,11 @@ class NativeRelayPlaybackWorker:
                         playback.connect(media=wanted_mode == "media"),
                         work,
                         timeout=self._command_timeout + 60,
-                        cancellable=False,
+                        # A cancelled catalog refresh may already have opened
+                        # the camera transport that the next playback needs.
+                        # Finish only that connect; browser playback remains
+                        # promptly cancellable.
+                        cancellable=not isinstance(work, _CatalogWork),
                     )
                     connection_mode = wanted_mode
                 if isinstance(work, _InteractivePlaybackWork):
