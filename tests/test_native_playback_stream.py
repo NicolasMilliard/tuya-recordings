@@ -90,6 +90,15 @@ def test_incrementally_reassembles_and_emits_multiple_frames():
     parser.finish()
 
 
+def test_zero_length_frame_preserves_following_media_frame():
+    empty, media = NativePlaybackStreamParser().feed(
+        frame(b"") + frame(b"\x00\x00\x00\x01\x65video")
+    )
+    assert empty.payload_length == 0
+    assert empty.payload == b""
+    assert media.payload == b"\x00\x00\x00\x01\x65video"
+
+
 def test_rejects_oversized_frame_before_waiting_for_payload():
     header = struct.pack(">HH7I", 1, 0, PLAYBACK_MAX_PAYLOAD_BYTES + 1, *([0] * 6))
     parser = NativePlaybackStreamParser()

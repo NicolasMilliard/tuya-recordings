@@ -17,6 +17,9 @@ from custom_components.tuya_recordings.lib.native_playback_stream import (
     PLAYBACK_CODEC_INFO_BYTES,
     NativePlaybackStreamParser,
 )
+from custom_components.tuya_recordings.lib.native_relay_media import (
+    NativeRelayMediaError,
+)
 from custom_components.tuya_recordings.lib.native_relay_runtime import (
     NativeRelayPlaybackWorker,
     NativeRelayRuntimeError,
@@ -1257,6 +1260,194 @@ def test_interactive_timeline_seeks_pauses_and_resumes_one_camera_object():
         for event in events
         if event["payload"]["type"] == "started"
     ] == [100, 205]
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_interactive_timeline_skips_empty_media_but_emits_valid_packets(
+    encrypted, caplog
+):
+    commands = queue.Queue()
+    events = []
+    uuid = "clip-uuid"
+    secret = "0123456789abcdef-extra"
+
+    def media_frame(payload, *, frame_type, codec, iv):
+        if encrypted:
+            return encrypted_wire_frame(
+                payload,
+                frame_type=frame_type,
+                codec=codec,
+                uuid=uuid,
+                secret=secret,
+                iv=iv,
+            )
+        return wire_frame(payload, frame_type=frame_type, codec=codec)
+
+    class EmptyThenMediaPlayback(Playback):
+        def __init__(self):
+            super().__init__()
+            self.received = 0
+
+        async def start(self, **kwargs):
+            self.started = kwargs
+            self._playback_started = True
+            self.frames.put_nowait(
+                media_frame(b"", frame_type=1, codec=1, iv=bytes(range(16)))
+            )
+            self.frames.put_nowait(
+                media_frame(
+                    b"\x00\x00\x00\x01\x65video",
+                    frame_type=1,
+                    codec=1,
+                    iv=bytes(range(16, 32)),
+                )
+            )
+            self.frames.put_nowait(
+                media_frame(
+                    b"aac", frame_type=3, codec=4, iv=bytes(range(32, 48))
+                )
+            )
+
+        async def receive_frame(self):
+            frame = await super().receive_frame()
+            self.received += 1
+            if self.received == 3:
+                commands.put(("stop", None))
+            return frame
+
+    playback = EmptyThenMediaPlayback()
+    session = NativeRelayRuntimeSession(
+        camera_config(),
+        app_session=APP_SESSION,
+        media_secrets=(
+            NativeMediaSecretStore(
+                lambda *args: [{"uuid": uuid, "secretKey": secret}]
+            )
+            if encrypted
+            else None
+        ),
+    )
+    request = NativePlaybackRequest(
+        start=100,
+        end=110,
+        encrypted=encrypted,
+        encryption_uuid=uuid if encrypted else "",
+        media_format=NativeMediaFormat.RAW_PACKETS,
+    )
+
+    with caplog.at_level(
+        "DEBUG", logger="custom_components.tuya_recordings.lib.native_relay_runtime"
+    ):
+        asyncio.run(session._interactive_connected(playback, request, events.append, commands))
+
+    media = [event for event in events if event["payload"]["type"] == "media-codec"]
+    assert len(media) == 2
+    assert [event["payload"]["info"]["avChannel"] for event in media] == [0, 1]
+    assert playback.stop_count == 1
+    assert f"origin={'decrypted' if encrypted else 'wire'}" in caplog.text
+
+
+def test_interactive_timeline_bounds_consecutive_empty_frames(monkeypatch):
+    from custom_components.tuya_recordings.lib import native_relay_runtime
+
+    monkeypatch.setattr(
+        native_relay_runtime, "_MAX_CONSECUTIVE_EMPTY_MEDIA_FRAMES", 2
+    )
+
+    class EmptyPlayback(Playback):
+        async def start(self, **kwargs):
+            self._playback_started = True
+            for _ in range(3):
+                self.frames.put_nowait(wire_frame(b"", frame_type=1))
+
+    playback = EmptyPlayback()
+    session = NativeRelayRuntimeSession(camera_config(), app_session=APP_SESSION)
+    with pytest.raises(NativeRelayRuntimeError, match="consecutive empty"):
+        asyncio.run(
+            session._interactive_connected(
+                playback,
+                NativePlaybackRequest(start=100, end=110),
+                lambda event: None,
+                queue.Queue(),
+            )
+        )
+    assert playback.stop_count == 1
+
+
+def test_empty_video_does_not_satisfy_first_frame_deadline():
+    class EmptyPlayback(Playback):
+        async def start(self, **kwargs):
+            self._playback_started = True
+            self.frames.put_nowait(wire_frame(b"", frame_type=1))
+
+    playback = EmptyPlayback()
+    session = NativeRelayRuntimeSession(
+        camera_config(), app_session=APP_SESSION, first_frame_timeout=0.01
+    )
+    with pytest.raises(NativeRelayRuntimeError, match="no media"):
+        asyncio.run(
+            session._interactive_connected(
+                playback,
+                NativePlaybackRequest(start=100, end=110),
+                lambda event: None,
+                queue.Queue(),
+            )
+        )
+    assert playback.stop_count == 1
+
+
+def test_empty_frame_does_not_hide_decryption_or_unexpected_frame_errors():
+    uuid = "clip-uuid"
+    secret = "0123456789abcdef-extra"
+    encrypted = encrypted_wire_frame(
+        b"",
+        frame_type=1,
+        codec=1,
+        uuid=uuid,
+        secret=secret,
+        iv=bytes(range(16)),
+    )
+    malformed = replace(encrypted, payload=b"bad", payload_length=3)
+
+    with pytest.raises(NativeRelayRuntimeError, match="decryption failed"):
+        NativeRelayRuntimeSession._convert_frame(malformed, {uuid: secret}, uuid)
+    with pytest.raises(NativeRelayMediaError, match="packet is empty"):
+        NativeRelayRuntimeSession._convert_frame(
+            wire_frame(b"", frame_type=9), {}, ""
+        )
+
+
+def test_clip_stream_skips_empty_frame_before_valid_audio_and_video():
+    class EmptyThenMediaPlayback(Playback):
+        async def start(self, **kwargs):
+            self._playback_started = True
+            self.frames.put_nowait(wire_frame(b"", frame_type=1))
+            self.frames.put_nowait(
+                wire_frame(b"\x00\x00\x00\x01\x65video", frame_type=1)
+            )
+            self.frames.put_nowait(wire_frame(b"aac", frame_type=3, codec=4))
+
+    playback = EmptyThenMediaPlayback()
+    events = []
+    session = NativeRelayRuntimeSession(
+        camera_config(),
+        app_session=APP_SESSION,
+        playback_factory=lambda *args, **kwargs: playback,
+        end_idle_timeout=0.01,
+    )
+
+    session.start_playback_stream(
+        NativePlaybackRequest(
+            start=100,
+            end=106,
+            media_format=NativeMediaFormat.RAW_PACKETS,
+        ),
+        events.append,
+    )
+
+    media = [event for event in events if event["payload"]["type"] == "media-codec"]
+    assert len(media) == 2
+    assert playback.stop_count == 1
 
 
 def test_interactive_timeline_cancellation_interrupts_a_blocked_frame_wait():
