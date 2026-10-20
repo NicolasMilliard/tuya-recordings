@@ -589,7 +589,7 @@ class TuyaRecordingsDebugView(http.HomeAssistantView):
             data = await request.json()
         except ValueError:
             data = {}
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Tuya Recordings frontend event phase=%s dev=%s start=%s end=%s detail=%s",
             data.get("phase"),
             data.get("dev_id"),
@@ -649,7 +649,7 @@ class TuyaRecordingsPlaybackView(http.HomeAssistantView):
         # A locally cached clip never needs a camera session, even when an old
         # frontend has retained a native transport query parameter.
         transport = "file" if clip_cached and playback_mode == "clip" else (request.query.get("transport") or "native")
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Tuya Recordings playback request dev=%s start=%s end=%s transport=%s cached=%s position=%s media_sync=%s paused=%s",
             dev_id,
             start_int,
@@ -856,7 +856,7 @@ class TuyaRecordingsTimelineView(http.HomeAssistantView):
         start, end = resolved
         position = max(start, min(end - 1, position))
         initial = client.timeline_request(dev_id, start, end, position)
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Tuya Recordings timeline playback requested dev=%s start=%s end=%s position=%s",
             dev_id,
             start,
