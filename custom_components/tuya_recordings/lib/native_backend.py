@@ -532,6 +532,10 @@ class ApkNativeRecordingBackend:
                     yield entered
                 else:
                     yield session
+            except Exception as err:
+                if queued_cancel.is_set():
+                    raise CameraWorkCancelled("Camera operation cancelled") from err
+                raise
             finally:
                 target = entered if entered is not None else session
                 try:
