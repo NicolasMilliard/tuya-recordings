@@ -13,13 +13,11 @@ from aiohttp import WSCloseCode, web
 
 from homeassistant.components import http
 from homeassistant.components.recorder import history
-from homeassistant.const import STATE_ON
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .client import TuyaRecordingsAuthError, TuyaRecordingsClient
 from .lib.commands import CameraWorkBusy, CameraWorkCancelled
-from .lib.recordings import as_epoch_seconds
 from .const import (
     DATA_INTERACTIVE_PLAYBACK_ACTIVE,
     DOMAIN,
@@ -121,6 +119,14 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
                 "thumbnail_cached": thumbnail_cached,
                 "thumbnail_url": _local_media_url(thumbnail_path, media_root) if thumbnail_cached else "",
             }
+            event_type = clip.get("event_type")
+            event_types = clip.get("event_types")
+            if type(event_type) is int:
+                item["event_type"] = event_type
+            if isinstance(event_types, (list, tuple)) and all(
+                type(value) is int for value in event_types
+            ):
+                item["event_types"] = list(event_types)
             if media_cache_only:
                 if not ready:
                     continue
@@ -169,35 +175,51 @@ def build_panel_data(client: TuyaRecordingsClient, index: dict[str, Any], media_
 
 
 def _person_detection_timestamps(
-    hass: HomeAssistant, entity_id: str, start: datetime, end: datetime
+    states: list[Any], start: datetime, end: datetime
 ) -> list[int]:
-    """Read person detections at the time reported by the camera."""
-    states = history.state_changes_during_period(
-        hass,
-        start,
-        end,
-        entity_id=entity_id,
-        no_attributes=False,
-        include_start_time_state=False,
-    ).get(entity_id, [])
+    """Return only explicit camera event times, never HA receipt times."""
     day_start = int(start.timestamp())
     day_end = int(end.timestamp())
     timestamps: list[int] = []
     for state in states:
-        if state.state != STATE_ON:
+        attributes = state.attributes.get("last_event_attributes")
+        if not isinstance(attributes, dict):
             continue
-        event_attributes = state.attributes.get("last_event_attributes")
-        attributes = event_attributes if isinstance(event_attributes, dict) else state.attributes
-        # These are ordered by how closely they describe when the camera saw
-        # the event. HA's state time is only the receipt-time fallback.
-        timestamp = 0
-        for key in ("time", "timestamp", "dp_timestamp"):
-            candidate = as_epoch_seconds(attributes.get(key))
+        # These fields arrive in the camera's notification payload. The
+        # recorder state-change time and Tuya DP receipt time are transport
+        # timing, not SD-card timing, and must never place a timeline marker.
+        for key in ("time", "timestamp"):
+            candidate = _as_epoch_seconds(attributes.get(key))
             if day_start <= candidate < day_end:
-                timestamp = candidate
+                timestamps.append(candidate)
                 break
-        timestamps.append(timestamp or int(state.last_changed.timestamp()))
-    return timestamps
+    return sorted(set(timestamps))
+
+
+def _as_epoch_seconds(value: Any) -> int:
+    """Convert an explicit camera timestamp to seconds."""
+    try:
+        epoch = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    return epoch // 1000 if epoch > 10_000_000_000 else epoch
+
+
+def _person_detections_in_recordings(
+    timestamps: list[int], recording_ranges: list[dict[str, Any]]
+) -> list[int]:
+    """Keep a person marker only when the camera SD catalog contains it."""
+    ranges = sorted(
+        (
+            (int(item.get("start") or 0), int(item.get("end") or 0))
+            for item in recording_ranges
+        ),
+    )
+    return [
+        timestamp
+        for timestamp in timestamps
+        if any(start <= timestamp < end for start, end in ranges if end > start)
+    ]
 
 
 def _empty_stats(client: TuyaRecordingsClient) -> dict[str, Any]:
@@ -488,7 +510,7 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
     async def _add_person_detection_markers(
         self, data: dict[str, Any], selected_date: str
     ) -> None:
-        """Attach local person-detection history for the selected timeline day."""
+        """Attach person markers only where camera and SD catalog timing agree."""
         try:
             selected_day = date.fromisoformat(selected_date)
         except ValueError:
@@ -507,22 +529,34 @@ class TuyaRecordingsPanelDataView(http.HomeAssistantView):
             return
         start = dt_util.start_of_local_day(selected_day)
         end = start + timedelta(days=1)
+        def history_rows(entity_id: str) -> list[Any]:
+            return history.state_changes_during_period(
+                self.hass,
+                start,
+                end,
+                entity_id=entity_id,
+                no_attributes=False,
+                include_start_time_state=False,
+            ).get(entity_id, [])
+
         try:
-            results = await asyncio.gather(
+            state_rows = await asyncio.gather(
                 *(
-                    self.hass.async_add_executor_job(
-                        _person_detection_timestamps, self.hass, entity_id, start, end
-                    )
+                    self.hass.async_add_executor_job(history_rows, entity_id)
                     for entity_id in sources.values()
                 )
             )
         except Exception as err:  # Recorder must never block SD-card playback.
             _LOGGER.debug("Unable to load person-detection history: %s", err)
             return
-        detections = dict(zip(sources, results, strict=True))
+        detections = {
+            dev_id: _person_detection_timestamps(rows, start, end)
+            for dev_id, rows in zip(sources, state_rows, strict=True)
+        }
         for camera in data.get("cameras", []):
-            camera["person_detections"] = detections.get(
-                str(camera.get("dev_id") or ""), []
+            dev_id = str(camera.get("dev_id") or "")
+            camera["person_detections"] = _person_detections_in_recordings(
+                detections.get(dev_id, []), camera.get("recording_ranges", [])
             )
 
     def _schedule_catalog_refresh(
