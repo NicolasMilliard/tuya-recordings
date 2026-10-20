@@ -1,5 +1,15 @@
 # Changelog
 
+## Tuya Recordings v0.4.4 (2026-10-20)
+
+Playback reliability correction.
+
+### Fixes
+
+- Ignores zero-length audio and video media frames after native playback
+  decryption, while retaining errors for invalid decryption and unknown frame
+  types. Valid subsequent media continues playing normally.
+
 ## Tuya Recordings v0.4.3 (2026-10-20)
 
 Corrective camera discovery and native capability release.
