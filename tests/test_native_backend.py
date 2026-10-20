@@ -16,7 +16,7 @@ from custom_components.tuya_recordings.lib.native_backend import (
     newest_first_days,
     _map_native_playback_error,
 )
-from custom_components.tuya_recordings.lib.commands import CameraWorkCancelled
+from custom_components.tuya_recordings.lib.commands import CAMERA_COMMANDS, CameraWorkCancelled
 from custom_components.tuya_recordings.lib.native_frames import (
     NativePlaybackFrame,
     NativePlaybackFrameType,
@@ -308,6 +308,18 @@ def test_native_backend_queries_catalog_through_one_helper_session():
     assert [clip["end"] for _, clips in result for clip in clips] == [20, 20]
     assert all(clips[0]["raw"]["type"] == "motion" for _, clips in result)
     assert session.closed is True
+
+
+def test_native_backend_reports_playback_interrupted_catalog_as_cancelled():
+    class InterruptedSession(FakeNativeSession):
+        def recordings_for_day(self, day):
+            CAMERA_COMMANDS._owner_cancel.set()
+            raise RuntimeError("Native camera work was cancelled")
+
+    with pytest.raises(CameraWorkCancelled):
+        native_backend(InterruptedSession()).recordings_for_day(
+            "camera", {}, {}, date(2026, 9, 16)
+        )
 
 
 def test_native_backend_normalizes_registered_v4_catalog_fields():
