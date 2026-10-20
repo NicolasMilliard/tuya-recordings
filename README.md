@@ -11,10 +11,12 @@
 
 ## What It Does
 
-Tuya Recordings adds SD-card recording playback to Home Assistant for cameras
-already available through the official Home Assistant **Tuya** integration.
-It follows the selected Smart Life or Tuya Smart app's native camera protocol,
-rather than using Tuya Cloud video storage or a separate camera bridge.
+Tuya Recordings adds SD-card recording playback to Home Assistant for compatible
+Smart Life and Tuya Smart cameras. Playback follows the selected account app's
+native camera protocol, rather than using Tuya Cloud video storage or a
+separate camera bridge. The official Home Assistant **Tuya** integration is
+used to discover the cameras; Tuya Recordings authorizes and runs SD playback
+through its own QR-authorized session.
 
 By default, choose a camera and date, then use a wall-clock timeline to play
 the recording at the selected time directly from the camera's SD card. Video
